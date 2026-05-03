@@ -2516,6 +2516,99 @@ fn set_codex_fast_mode(enable: bool) -> Result<String, String> {
     }
 }
 
+/// 切换 ~/.codex/config.toml 里的 [features] goals 开关
+#[tauri::command]
+fn set_codex_features_goals(enable: bool) -> Result<String, String> {
+    let config_path = dirs::home_dir()
+        .ok_or("无法获取用户目录")?
+        .join(".codex")
+        .join("config.toml");
+
+    let content = if config_path.exists() {
+        std::fs::read_to_string(&config_path).map_err(|e| format!("读取 config.toml 失败: {}", e))?
+    } else {
+        String::new()
+    };
+
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut in_features = false;
+    let mut features_header_idx: Option<usize> = None;
+    let mut goals_seen = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_features = trimmed == "[features]";
+            if in_features {
+                features_header_idx = Some(new_lines.len());
+            }
+        }
+        // 在 [features] section 里匹配 goals = ... 行
+        if in_features && trimmed.starts_with("goals") && trimmed.contains('=') && !trimmed.starts_with('[') {
+            goals_seen = true;
+            if enable {
+                new_lines.push("goals = true".to_string());
+            }
+            // disable 时跳过这行（移除）
+            continue;
+        }
+        new_lines.push(line.to_string());
+    }
+
+    if enable {
+        if features_header_idx.is_none() {
+            // 没有 [features] section → 在文件末尾追加
+            if !new_lines.is_empty() && !new_lines.last().map(|l| l.is_empty()).unwrap_or(true) {
+                new_lines.push(String::new());
+            }
+            new_lines.push("[features]".to_string());
+            new_lines.push("goals = true".to_string());
+        } else if !goals_seen {
+            // 有 [features] section 但没 goals 行 → 紧跟在 header 后面插
+            let idx = features_header_idx.unwrap();
+            new_lines.insert(idx + 1, "goals = true".to_string());
+        }
+    }
+
+    std::fs::write(&config_path, new_lines.join("\n") + "\n")
+        .map_err(|e| format!("写入 config.toml 失败: {}", e))?;
+
+    Ok(if enable {
+        "[features] goals = true 已写入。重启 Codex 生效。".to_string()
+    } else {
+        "[features] goals 已关闭。重启 Codex 生效。".to_string()
+    })
+}
+
+/// 读 ~/.codex/config.toml 里的 [features] goals 开关
+#[tauri::command]
+fn get_codex_features_goals() -> Result<bool, String> {
+    let config_path = dirs::home_dir()
+        .ok_or("无法获取用户目录")?
+        .join(".codex")
+        .join("config.toml");
+
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(&config_path).map_err(|e| format!("读取失败: {}", e))?;
+    let mut in_features = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_features = trimmed == "[features]";
+            continue;
+        }
+        if in_features && trimmed.starts_with("goals") && trimmed.contains('=') {
+            return Ok(trimmed.contains("true"));
+        }
+    }
+
+    Ok(false)
+}
+
 /// 获取当前 fast 模式状态
 #[tauri::command]
 fn get_codex_fast_mode() -> Result<bool, String> {
@@ -3200,6 +3293,8 @@ pub fn run() {
             show_main_window_cmd,
             set_codex_fast_mode,
             get_codex_fast_mode,
+            set_codex_features_goals,
+            get_codex_features_goals,
             get_token_history,
             get_session_bindings,
             get_switch_history,

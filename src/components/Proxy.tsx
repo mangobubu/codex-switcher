@@ -52,16 +52,19 @@ export function Proxy() {
     const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     const [switchedAccount, setSwitchedAccount] = useState<string | null>(null);
     const [fastMode, setFastMode] = useState(false);
+    const [goalsMode, setGoalsMode] = useState(false);
 
     const fetchAll = async () => {
         try {
-            const [s, st, fm] = await Promise.all([
+            const [s, st, fm, gm] = await Promise.all([
                 invoke<AppSettings>('get_settings'),
                 invoke<ProxyStatus>('get_proxy_status'),
                 invoke<boolean>('get_codex_fast_mode'),
+                invoke<boolean>('get_codex_features_goals'),
             ]);
             setSettings(s);
             setFastMode(fm);
+            setGoalsMode(gm);
             setStatus(st);
             setPort(s.proxy_port);
         } catch (e) {
@@ -465,6 +468,30 @@ export function Proxy() {
                         }}
                     >
                         {fastMode ? '关闭 Fast' : '开启 Fast'}
+                    </button>
+                </div>
+                <div className="setting-item">
+                    <div className="setting-info">
+                        <span className="setting-label">Goals 实验特性</span>
+                        <span className="setting-desc">
+                            写入 <code>[features]</code> goals = true 到 ~/.codex/config.toml。
+                            {goalsMode ? '当前：已开启' : '当前：已关闭'}
+                        </span>
+                    </div>
+                    <button
+                        className={`proxy-toggle-btn ${goalsMode ? 'on' : 'off'}`}
+                        onClick={async () => {
+                            try {
+                                const result = await invoke<string>('set_codex_features_goals', { enable: !goalsMode });
+                                setGoalsMode(!goalsMode);
+                                setMessage({ type: 'success', text: result });
+                                setTimeout(() => setMessage(null), 3000);
+                            } catch (e) {
+                                setMessage({ type: 'error', text: `${e}` });
+                            }
+                        }}
+                    >
+                        {goalsMode ? '关闭 Goals' : '开启 Goals'}
                     </button>
                 </div>
             </div>
