@@ -1325,16 +1325,38 @@ pub async fn do_one_fast_auth_sync(
     if mode != "client" || secret.is_empty() {
         return false;
     }
-    let Some(cid) = current_id else { return false; };
+    let local_cid = current_id;
 
     let base = match remote_client::resolve_base_url(&primary, &fallback).await {
         Ok(b) => b,
         Err(_) => return false,
     };
+
+    // 1) 先看 Server 的 current 是不是跟本机 store.current 一致，不一致 → 优先对齐到 Server
+    let target_cid = match remote_client::get_current(&base, &secret).await {
+        Ok(cur) => match cur.current {
+            Some(server_cid) => {
+                if local_cid.as_deref() != Some(server_cid.as_str()) {
+                    println!(
+                        "[FastAuthSync] Server current ({}) 与本机 ({:?}) 不一致，对齐到 Server",
+                        server_cid, local_cid
+                    );
+                }
+                Some(server_cid)
+            }
+            None => local_cid.clone(),
+        },
+        Err(_) => local_cid.clone(),
+    };
+    let Some(cid) = target_cid else { return false; };
+
+    // 2) 拉 cid 的最新 token 写盘
     match remote_client::fetch_token(&base, &secret, &cid).await {
         Ok(t) => {
             if let Ok(mut s) = store.lock() {
                 s.sync_account_from_auth_json(&cid, t.auth_json.clone());
+                // 把本机 current 也对齐上（如果之前不一致）
+                s.current = Some(cid.clone());
                 let _ = s.save();
             }
             // 扩展 expires_at 到 +24h，codex CLI 看到"很新鲜"就不会自己 refresh，

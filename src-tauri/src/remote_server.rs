@@ -881,8 +881,13 @@ async fn handle_solo_current(
             .as_ref()
             .and_then(|id| store.accounts.get(id))
             .map(|a| a.name.clone());
-        // solo 模式仅同步 current 指针：不重选号、不刷新 auth.json（Server 可能并未使用）
-        store.current = Some(new_id.clone());
+        // 用 switch_to 而不是只改 current 指针 —— Server 端如果也跑 Codex CLI，需要让它的
+        // ~/.codex/auth.json 跟着同步，否则两端 Codex 用不同账号容易撞 RT 轮换。
+        // 这里强制 cold（hot=false），因为 client 推过来的语义就是"两端都对齐到这个号"，
+        // 不应该被 Server 自己的 hot/cold 偏好覆盖。
+        if let Err(e) = store.switch_to(&new_id, false) {
+            return err_resp(format!("switch_to 失败: {}", e));
+        }
         if let Err(e) = store.save() {
             return err_resp(format!("保存失败: {}", e));
         }
