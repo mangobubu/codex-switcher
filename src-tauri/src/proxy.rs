@@ -854,20 +854,14 @@ async fn handle_request(
                 return Ok(build_stream_response(mini_resp, None, None));
             }
             Err(e) => {
-                eprintln!("[Proxy] Server 转发失败，尝试本地账号回退: {}", e);
-                if let Some(resp) = try_local_fallback(
-                    &state,
-                    &method,
-                    &path_and_query,
-                    &req_headers,
-                    &body_bytes,
-                    session_key.as_deref(),
-                )
-                .await
-                {
-                    return Ok(resp);
-                }
-                return Ok(error_response(StatusCode::BAD_GATEWAY, &e));
+                eprintln!(
+                    "[Proxy] Server 转发失败（{}），fall through 到本地完整 401/429 处理路径",
+                    e
+                );
+                // 不再 early-return：让执行流走到下面非 client 模式的完整逻辑去
+                // （含 silent_refresh + try_switch_and_retry + SSE bootstrap）
+                // 这样即使 Server 不可达，本机用 store.current 的 token 直连上游被 401 时，
+                // 也会自动 refresh / 切号，而不是把 401 透回给 codex。
             }
         }
     }

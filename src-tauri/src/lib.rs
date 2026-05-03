@@ -3306,6 +3306,19 @@ pub fn run() {
             // 快速 auth.json 同步循环（client 模式专用，但循环内自检模式，可以无脑启动）
             let _fast_auth_handle = start_fast_auth_sync(state.store.clone());
 
+            // client 模式下 server_url 空 → 用户配置错位，明确警告
+            if let Ok(s) = state.store.lock() {
+                if s.settings.remote_mode == "client"
+                    && s.settings.remote_server_url.trim().is_empty()
+                    && s.settings.remote_server_url_fallback.trim().is_empty()
+                {
+                    eprintln!(
+                        "[Config] ⚠️ client 模式但 remote_server_url 为空 —— Server 不可达，本机将退回直连本地账号。\n\
+                         去 设置 → 远程模式 填上 Server 地址（比如 http://192.168.2.14:18081）。"
+                    );
+                }
+            }
+
             // solo 模式心跳循环（向 Server 声明"本机接管保活"）
             if remote_mode == "solo" {
                 let handle =
