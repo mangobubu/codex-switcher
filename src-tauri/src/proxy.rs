@@ -1039,14 +1039,24 @@ async fn handle_request(
             .unwrap_or_else(|_| error_response(StatusCode::TOO_MANY_REQUESTS, "429")));
     }
 
-    // 7.5 上游 5xx + 全局容量满 → 同号 backoff retry，不切号
-    // 典型场景：OpenAI 模型池过载，返回 503 + body "Selected model is at capacity..."
-    // 这种**不是单号问题**，切号也撞同样错；同号等几秒重试就能继续。
-    if status_code.as_u16() >= 500 && status_code.as_u16() < 600 {
+    // 7.5 上游容量满 → 同号 backoff retry，不切号
+    // 典型场景：OpenAI 模型池过载，返回 5xx + body "Selected model is at capacity..."
+    // 或 HTTP 200 + JSON body 含 server_overloaded / at capacity（codex App 内部 API
+    // 调用偶尔会用这种）。两种都不是单号问题，切号也撞同样错；同号等几秒重试就能继续。
+    let is_json_response = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_lowercase().contains("json"))
+        .unwrap_or(false);
+    let should_check_capacity_body = (status_code.as_u16() >= 500 && status_code.as_u16() < 600)
+        || (status_code == reqwest::StatusCode::OK && is_json_response);
+    if should_check_capacity_body {
         let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
         let body_lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
         let is_capacity = matches_global_capacity(&body_lower)
-            || status_code == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+            || status_code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || body_lower.contains("server_overloaded");
         if is_capacity {
             println!("[Proxy] 上游 {} + 容量满，同号 backoff retry...", status_code);
             for attempt in 1..=3u64 {
