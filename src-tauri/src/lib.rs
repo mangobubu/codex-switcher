@@ -1285,8 +1285,10 @@ async fn solo_sync_current(
     }
 }
 
-/// solo 模式下把当前 current 同步推给 Server。fire-and-forget，不阻塞调用方。
-/// Server 不可达时只记一条日志——下一次切号重试（暂不实现 pending 队列，先看实测）。
+/// 手工切号后把 current 同步推给 Server（solo + client 模式都需要）。
+/// 这样 Server.current = 用户选的号，fast_auth_sync 30s 拉到的也是同一个，
+/// 不会再"用户切到 X，30 秒后又被 Server 拉回 Y"。
+/// fire-and-forget，不阻塞调用方；Server 不可达只记日志。
 async fn push_solo_current_if_needed(state: tauri::State<'_, AppState>, new_id: &str) {
     let (mode, primary, fallback, secret) = {
         match state.store.lock() {
@@ -1299,16 +1301,19 @@ async fn push_solo_current_if_needed(state: tauri::State<'_, AppState>, new_id: 
             Err(_) => return,
         }
     };
-    if mode != "solo" || secret.is_empty() {
+    // solo + client 都要 push（off / server 模式没 Server 可推）
+    if !matches!(mode.as_str(), "solo" | "client") || secret.is_empty() {
         return;
     }
     match remote_client::resolve_base_url(&primary, &fallback).await {
         Ok(base) => {
             if let Err(e) = remote_client::push_solo_switch(&base, &secret, new_id).await {
-                eprintln!("[Solo] push /solo/current 失败（已本地生效）: {}", e);
+                eprintln!("[Switch] push /solo/current 失败（已本地生效）: {}", e);
+            } else {
+                println!("[Switch] 手工切号已同步到 Server (mode={})", mode);
             }
         }
-        Err(e) => eprintln!("[Solo] Server 不可达，切号未同步: {}", e),
+        Err(e) => eprintln!("[Switch] Server 不可达，切号未同步: {}", e),
     }
 }
 
