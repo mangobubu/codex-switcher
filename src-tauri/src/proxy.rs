@@ -1019,9 +1019,89 @@ async fn handle_request(
             .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "响应构建失败")));
     }
 
-    // 7. 429 自动切号
+    // 7. HTTP 429：按 body 内容分流
+    //   - body 含 server_is_overloaded / slow_down → **全局过载**，同号 backoff retry
+    //     （切号撞同样错，烧账号没用）
+    //   - body 含 usage_limit_reached / insufficient_quota / usage_not_included
+    //     → per-account 配额耗尽，切号
+    //   - 其他 429（无明确 code） → 默认切号
     if status_code == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        println!("[Proxy] 收到 429，标记额度耗尽并切号...");
+        let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
+        let body_lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
+        let is_capacity = body_lower.contains("server_is_overloaded")
+            || body_lower.contains("slow_down")
+            || matches_global_capacity(&body_lower);
+
+        if is_capacity {
+            println!("[Proxy] HTTP 429 + body 含 capacity 关键词，同号 backoff retry...");
+            // 同号 backoff retry 3 次（复用与 step 7.5 同样的逻辑思路）
+            for attempt in 1..=3u64 {
+                let backoff = std::time::Duration::from_secs(2 * attempt);
+                tokio::time::sleep(backoff).await;
+                let (retry_token, _) = match resolve_token_with_affinity(
+                    &state,
+                    session_key.as_deref(),
+                )
+                .await
+                {
+                    Ok((t, c, _)) => (t, c),
+                    Err(_) => continue,
+                };
+                if let Ok(retry_resp) = forward_with_token(
+                    &state,
+                    &method,
+                    &upstream_url,
+                    &base_headers,
+                    &body_bytes,
+                    &retry_token,
+                )
+                .await
+                {
+                    let s = retry_resp.status();
+                    if s == reqwest::StatusCode::OK {
+                        println!("[Proxy] 429 capacity 同号 retry 第 {} 次成功", attempt);
+                        if is_sse_response(&retry_resp) {
+                            let h = retry_resp.headers().clone();
+                            let stream = retry_resp.bytes_stream().boxed();
+                            let resp = build_streaming_response_with_bootstrap(
+                                state.clone(),
+                                s,
+                                h,
+                                stream,
+                                method.clone(),
+                                upstream_url.clone(),
+                                base_headers.clone(),
+                                body_bytes.clone(),
+                                session_affinity_ctx.clone(),
+                            );
+                            return Ok(resp);
+                        }
+                        return Ok(build_stream_response(
+                            retry_resp,
+                            Some(state.tracker.clone()),
+                            session_affinity_ctx.clone(),
+                        ));
+                    }
+                    if s == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || (s.as_u16() >= 500 && s.as_u16() < 600)
+                    {
+                        continue;
+                    }
+                    return Ok(build_stream_response(
+                        retry_resp,
+                        Some(state.tracker.clone()),
+                        session_affinity_ctx.clone(),
+                    ));
+                }
+            }
+            println!("[Proxy] 429 capacity 同号 retry 三次都失败，降级走切号兜底");
+            // 撑不住 → 切号兜底
+        }
+
+        // 走切号路径（per-account 限额 OR capacity 同号 retry 失败兜底）
+        if !is_capacity {
+            println!("[Proxy] HTTP 429 (per-account 限额)，标记额度耗尽并切号...");
+        }
         mark_current_quota_depleted(&state);
         if let Some(resp) = dispatch_quota_switch_retry(
             &state,
@@ -1037,7 +1117,6 @@ async fn handle_request(
             return Ok(resp);
         }
         // 切号失败/账号耗尽 → 缓冲原始 429 返回
-        let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
         return Ok(Response::builder()
             .status(429)
             .header("content-type", "application/json")
