@@ -772,9 +772,10 @@ async fn handle_switch(state: &ApiState, req: Request<Incoming>) -> Response<Res
         .and_then(|id| store.accounts.get(id))
         .map(|a| a.name.clone());
 
-    // Server 侧按本机 switch_mode + proxy_enabled 决定热/冷。粗估：proxy_enabled 即视为 running。
-    let hot = crate::account::should_hot_switch(&store.settings, store.settings.proxy_enabled);
-    if let Err(e) = store.switch_to(&new_id, hot) {
+    // Server 侧切号同样强制 cold：Server 这台机器很可能也跑 codex App / IDE，
+    // 它们读 disk auth.json 不读 store。hot 模式会让 IDE 用旧号→401→
+    // UnauthorizedRecovery 撞 account_id mismatch 永久失败。
+    if let Err(e) = store.switch_to(&new_id, false) {
         return err_resp(format!("switch_to 失败: {}", e));
     }
     if let Err(e) = store.save() {

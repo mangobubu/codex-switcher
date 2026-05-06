@@ -665,9 +665,11 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
         .and_then(|a| a.cached_quota.as_ref())
         .map(|q| q.five_hour_left);
 
-    // 代理内部切号：代理肯定在跑，直接按 switch_mode 决定。cold 强制写 auth.json。
-    let hot = crate::account::should_hot_switch(&store.settings, true);
-    store.switch_to(new_id, hot)?;
+    // 代理内部切号：**强制 cold（写 auth.json）**。
+    // 历史 hot 模式假设"用户的 codex 全走 proxy，store 改一下就够"，但实际上同一台机器
+    // 经常也跑 codex App / IDE，它们绕过 OPENAI_BASE_URL 直接读 ~/.codex/auth.json，
+    // 不写盘就会用旧号→401→撞 UnauthorizedRecovery account_id mismatch。
+    store.switch_to(new_id, false)?;
     store.save()?;
     // 切号后远端 token 缓存作废，下一次请求重新拉
     invalidate_remote_token_cache();
@@ -1268,7 +1270,9 @@ async fn try_remote_switch_and_retry(
                 return None;
             }
         };
-        match forward_and_bootstrap(state, method, upstream_url, base_headers, body, &new_token, session_key)
+        // 切号到新账号 → prompt_cache_key 拼 account_id
+        let body_for_new = rewrite_prompt_cache_key(body, &new_current);
+        match forward_and_bootstrap(state, method, upstream_url, base_headers, &body_for_new, &new_token, session_key)
             .await
         {
             BootstrappedForward::Ok(resp) => {
@@ -1283,6 +1287,12 @@ async fn try_remote_switch_and_retry(
                     "[Proxy] 第 {} 次 Server 切号后仍限额/容量满，再试",
                     attempt + 1
                 );
+                continue;
+            }
+            BootstrappedForward::Unauthorized => {
+                // Server 给的 token 失效（罕见，Server 应该已经 refresh 过了）。继续 retry，
+                // 下一轮 request_switch 会让 Server 选别的号
+                println!("[Proxy] 第 {} 次 Server 切号 token 失效，再试", attempt + 1);
                 continue;
             }
             BootstrappedForward::Banned => {
@@ -1361,13 +1371,14 @@ async fn try_switch_and_retry(
                     eprintln!("[Proxy] 切号失败: {}", e);
                     continue;
                 }
-
+                // 切号到新账号 → prompt_cache_key 拼 account_id 让 cache 按账号隔离
+                let body_for_new = rewrite_prompt_cache_key(body, &id);
                 match forward_and_bootstrap(
                     state,
                     method,
                     upstream_url,
                     base_headers,
-                    body,
+                    &body_for_new,
                     &token,
                     session_key,
                 )
@@ -1390,6 +1401,18 @@ async fn try_switch_and_retry(
                     BootstrappedForward::Banned => {
                         println!("[Proxy] 第 {} 次切号目标号疑似封号", attempt + 1);
                         mark_current_banned(state);
+                        continue;
+                    }
+                    BootstrappedForward::Unauthorized => {
+                        // 切到的新号 token 也失效了（refresh_token 已轮换或被吊销），
+                        // 标记 token_invalid 让 pick_next 跳过，继续找下一个
+                        println!("[Proxy] 第 {} 次切号目标号 token 失效", attempt + 1);
+                        if let Ok(mut store) = state.store.lock() {
+                            if let Some(acc) = store.accounts.get_mut(&id) {
+                                acc.is_token_invalid = true;
+                                let _ = store.save();
+                            }
+                        }
                         continue;
                     }
                     BootstrappedForward::Failed(e) => {
@@ -1528,8 +1551,9 @@ async fn try_local_fallback(
     let is_chatgpt = token.starts_with("eyJ");
     let (upstream_url, upstream_host) = get_upstream(is_chatgpt, path_and_query);
     let base_headers = build_upstream_headers(req_headers, upstream_host);
-
-    match forward_and_bootstrap(state, method, &upstream_url, &base_headers, body, &token, session_key).await {
+    // 切号到新账号 → prompt_cache_key 拼 account_id
+    let body_for_new = rewrite_prompt_cache_key(body, &id);
+    match forward_and_bootstrap(state, method, &upstream_url, &base_headers, &body_for_new, &token, session_key).await {
         BootstrappedForward::Ok(resp) => {
             println!("[Proxy] 本地回退转发成功");
             Some(resp)
@@ -1547,6 +1571,10 @@ async fn try_local_fallback(
         BootstrappedForward::Banned => {
             println!("[Proxy] 本地回退账号疑似封号");
             mark_current_banned(state);
+            None
+        }
+        BootstrappedForward::Unauthorized => {
+            println!("[Proxy] 本地回退账号 token 失效");
             None
         }
         BootstrappedForward::Failed(e) => {
@@ -1786,6 +1814,9 @@ enum BootstrappedForward {
     Capacity,
     /// 流内封号事件 → 调用方应该标记封号并切号重试
     Banned,
+    /// 401/403 token 失效 → 调用方应该 silent_refresh + 重试，不能透回 codex
+    /// （否则触发 codex UnauthorizedRecovery，撞 account_id mismatch 永久失败）
+    Unauthorized,
     /// 上游连接错误
     Failed(String),
 }
@@ -1806,6 +1837,10 @@ async fn forward_and_bootstrap(
     let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return BootstrappedForward::RateLimit;
+    }
+    // 401/403 不能透回 codex：触发它的 UnauthorizedRecovery 会撞 account_id mismatch 永久失败
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return BootstrappedForward::Unauthorized;
     }
     let aff = make_affinity_ctx(state, session_key);
     // 非 200 或非 SSE：保留旧行为，直接透传给客户端
@@ -1901,6 +1936,41 @@ struct AffinityCtx {
     affinity: Arc<SessionAffinity>,
     session_key: String,
     account_id: String,
+}
+
+/// 切号到新账号时调用：把 body 里的 `prompt_cache_key` 后缀拼上当前 account_id。
+/// codex CLI/App 默认用 `conversation_id` 当 prompt_cache_key（codex-rs/core/src/client.rs:699）
+/// —— 不区分账号。账号 A 写过 cache 后，切到 B 拿同样 key 命中的 cache 在 OpenAI
+/// user-shard 里根本不存在，造成 cache miss。
+///
+/// 拼上 `::<account_id>` 后缀让 cache 按账号天然隔离：
+///   - 同号请求保持原 key（cache 持续命中）
+///   - 切到新号自动用新 key（OpenAI 那边 cold cache 一轮，下一轮起 warm）
+///
+/// 注意：只在切号 retry 路径调用。第一次发请求时不动，让 codex 自己原始的
+/// conversation_id 走（codex 重启会重新生成 conversation_id，自动带换号语义）。
+fn rewrite_prompt_cache_key(body: &Bytes, account_id: &str) -> Bytes {
+    if account_id.is_empty() {
+        return body.clone();
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return body.clone();
+    };
+    let new_key = match obj.get("prompt_cache_key").and_then(|x| x.as_str()) {
+        Some(orig) if !orig.is_empty() => format!("{}::{}", orig, account_id),
+        _ => format!("acc::{}", account_id),
+    };
+    obj.insert(
+        "prompt_cache_key".to_string(),
+        serde_json::Value::String(new_key),
+    );
+    match serde_json::to_vec(&v) {
+        Ok(s) => Bytes::from(s),
+        Err(_) => body.clone(),
+    }
 }
 
 fn make_affinity_ctx(state: &ProxyState, session_key: Option<&str>) -> Option<AffinityCtx> {
@@ -2073,7 +2143,9 @@ async fn acquire_replacement_upstream(
         adopt_remote_current(state, &base, &secret, &new_current).await.ok()?;
         invalidate_remote_token_cache();
         let (new_token, _) = get_current_token(state).await.ok()?;
-        let resp = forward_with_token(state, method, upstream_url, base_headers, body, &new_token).await.ok()?;
+        // 切号到新账号 → prompt_cache_key 拼 account_id
+        let body_for_new = rewrite_prompt_cache_key(body, &new_current);
+        let resp = forward_with_token(state, method, upstream_url, base_headers, &body_for_new, &new_token).await.ok()?;
         if resp.status() != reqwest::StatusCode::OK {
             return None;
         }
@@ -2084,7 +2156,9 @@ async fn acquire_replacement_upstream(
     let pick = pick_next_account(state);
     let PickResult::Found { id, token } = pick else { return None; };
     do_switch(state, &id, reason).ok()?;
-    let resp = forward_with_token(state, method, upstream_url, base_headers, body, &token).await.ok()?;
+    // 切号到新账号 → prompt_cache_key 拼 account_id
+    let body_for_new = rewrite_prompt_cache_key(body, &id);
+    let resp = forward_with_token(state, method, upstream_url, base_headers, &body_for_new, &token).await.ok()?;
     if resp.status() != reqwest::StatusCode::OK {
         return None;
     }
