@@ -381,6 +381,7 @@ function App() {
             onRefreshUsage={refreshUsage}
             onNavigateToAccounts={() => setCurrentPage('accounts')}
             onExport={handleExport}
+            proxyRunning={proxyRunning}
             syncStatus={syncStatus}
             onSyncWithDisk={async () => {
               try {

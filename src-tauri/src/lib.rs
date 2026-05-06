@@ -1305,12 +1305,20 @@ async fn push_solo_current_if_needed(state: tauri::State<'_, AppState>, new_id: 
     if !matches!(mode.as_str(), "solo" | "client") || secret.is_empty() {
         return;
     }
+    // client 模式 = 两端协作，让 Server 也写 disk（apply_to_disk=true）
+    // solo 模式 = 本机自治，Server 仅记录 current 指针归档（apply_to_disk=false）
+    let apply_to_disk = mode == "client";
     match remote_client::resolve_base_url(&primary, &fallback).await {
         Ok(base) => {
-            if let Err(e) = remote_client::push_solo_switch(&base, &secret, new_id).await {
+            if let Err(e) =
+                remote_client::push_solo_switch(&base, &secret, new_id, apply_to_disk).await
+            {
                 eprintln!("[Switch] push /solo/current 失败（已本地生效）: {}", e);
             } else {
-                println!("[Switch] 手工切号已同步到 Server (mode={})", mode);
+                println!(
+                    "[Switch] 手工切号已同步到 Server (mode={}, apply_to_disk={})",
+                    mode, apply_to_disk
+                );
             }
         }
         Err(e) => eprintln!("[Switch] Server 不可达，切号未同步: {}", e),

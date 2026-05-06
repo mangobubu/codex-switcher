@@ -665,11 +665,12 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
         .and_then(|a| a.cached_quota.as_ref())
         .map(|q| q.five_hour_left);
 
-    // 代理内部切号：**强制 cold（写 auth.json）**。
-    // 历史 hot 模式假设"用户的 codex 全走 proxy，store 改一下就够"，但实际上同一台机器
-    // 经常也跑 codex App / IDE，它们绕过 OPENAI_BASE_URL 直接读 ~/.codex/auth.json，
-    // 不写盘就会用旧号→401→撞 UnauthorizedRecovery account_id mismatch。
-    store.switch_to(new_id, false)?;
+    // 代理内部切号：按 switch_mode 决定 hot/cold。proxy 在跑时 hot 完全够 ——
+    // 因为 codex（CLI / App 内置二进制）走 OPENAI_BASE_URL=proxy，每次请求 proxy
+    // 注入 store.current 的 token，codex 永远拿到 200，不触发 UnauthorizedRecovery。
+    // disk auth.json 跟 store 不一致只是"UI 显眼"，不影响 codex 实际工作。
+    let hot = crate::account::should_hot_switch(&store.settings, true);
+    store.switch_to(new_id, hot)?;
     store.save()?;
     // 切号后远端 token 缓存作废，下一次请求重新拉
     invalidate_remote_token_cache();
@@ -724,8 +725,11 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
         tauri::async_runtime::spawn(async move {
             match crate::remote_client::resolve_base_url(&primary, &fallback).await {
                 Ok(base) => {
-                    if let Err(e) =
-                        crate::remote_client::push_solo_switch(&base, &secret, &nid).await
+                    // solo 模式：apply_to_disk=false，Server 仅归档 current 不写盘
+                    if let Err(e) = crate::remote_client::push_solo_switch(
+                        &base, &secret, &nid, false,
+                    )
+                    .await
                     {
                         eprintln!("[Solo] 自动切号后 push Server 失败: {}", e);
                     }

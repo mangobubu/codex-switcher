@@ -484,14 +484,21 @@ pub async fn send_solo_heartbeat(
     Ok(())
 }
 
-/// solo 模式切号同步：告诉 Server 本机刚切到了 new_id。Server 仅记录 current，不重跑选号。
+/// 客户端切号同步：告诉 Server 本机刚切到了 new_id。
+///
+/// `apply_to_disk` 区分两种语义：
+/// - `true`（client 模式）：Server 也跟着切——写 ~/.codex/auth.json，让 Server 那台机器的
+///   codex 也用同一个号工作。两台机器永远在同一账号上，cache 一致、协作顺畅。
+/// - `false`（solo 模式）：Server 仅更新 current 指针归档，**不写盘**。Server 那边可能
+///   独立跑别的任务，不能被本机劫持。
 pub async fn push_solo_switch(
     base_url: &str,
     secret: &str,
     new_id: &str,
+    apply_to_disk: bool,
 ) -> Result<(), String> {
     let url = format!("{}/solo/current", trim_url(base_url));
-    let body = serde_json::json!({ "current": new_id });
+    let body = serde_json::json!({ "current": new_id, "apply_to_disk": apply_to_disk });
     let resp = client()?
         .post(&url)
         .header(AUTH_HEADER, secret)

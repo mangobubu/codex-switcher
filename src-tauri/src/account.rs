@@ -548,7 +548,17 @@ impl AccountStore {
     }
 
     /// 切换到指定账号
-    pub fn switch_to(&mut self, id: &str, hot: bool) -> Result<(), String> {
+    /// 切号：改 store.current + 写 ~/.codex/auth.json。
+    ///
+    /// 历史上 `hot` 参数控制"是否跳过写 auth.json"——目的是代理在跑时省一次 IO。
+    /// 但实测发现：hot 模式下虽然 proxy 注入新号 token 让 codex 拿到 200，但
+    /// **disk auth.json 没同步会让 codex 端的某些状态（IDE 显示、UnauthorizedRecovery
+    /// 触发时的校验、以及"账号同步状态"UI 提示）感到不一致**，用户要手动"继续"
+    /// codex 才肯往下跑——这违背了 hot 的初衷。
+    ///
+    /// 现在 always 写 disk：写盘几毫秒 IO 几乎免费，但能保证 store ↔ disk 永远一致。
+    /// `hot` 参数保留但不再影响行为，避免改太多调用点。
+    pub fn switch_to(&mut self, id: &str, _hot_legacy: bool) -> Result<(), String> {
         let account = self
             .accounts
             .get_mut(id)
@@ -556,15 +566,9 @@ impl AccountStore {
 
         account.last_used = Some(Utc::now());
 
-        if hot {
-            // 热切：不写 auth.json。Codex App 内存里的账号不会变，但代理会用新号的 token
-            // 替换所有请求的 Authorization 头。前提是代理在跑。
-            println!("正在切换账号（热切，跳过写 auth.json）: {}", id);
-        } else {
-            println!("正在切换账号（冷切，写 auth.json）: {}", id);
-            Self::write_codex_auth(&account.auth_json)?;
-            println!("账号切换成功: auth.json 已更新");
-        }
+        println!("正在切换账号: {}", id);
+        Self::write_codex_auth(&account.auth_json)?;
+        println!("账号切换成功: auth.json 已更新");
 
         self.current = Some(id.to_string());
         Ok(())

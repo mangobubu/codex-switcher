@@ -772,10 +772,11 @@ async fn handle_switch(state: &ApiState, req: Request<Incoming>) -> Response<Res
         .and_then(|id| store.accounts.get(id))
         .map(|a| a.name.clone());
 
-    // Server 侧切号同样强制 cold：Server 这台机器很可能也跑 codex App / IDE，
-    // 它们读 disk auth.json 不读 store。hot 模式会让 IDE 用旧号→401→
-    // UnauthorizedRecovery 撞 account_id mismatch 永久失败。
-    if let Err(e) = store.switch_to(&new_id, false) {
+    // Server 侧按本机 switch_mode + proxy_enabled 决定热/冷。粗估：proxy_enabled 即视为 running。
+    // proxy 在跑时 hot 够用，因为 Server 这台机器上的 codex / Codex App 也走 proxy
+    // (OPENAI_BASE_URL = localhost:proxy_port)，永远拿到 store.current 的 token。
+    let hot = crate::account::should_hot_switch(&store.settings, store.settings.proxy_enabled);
+    if let Err(e) = store.switch_to(&new_id, hot) {
         return err_resp(format!("switch_to 失败: {}", e));
     }
     if let Err(e) = store.save() {
@@ -846,6 +847,10 @@ async fn handle_solo_heartbeat(req: Request<Incoming>) -> Response<ResponseBody>
 #[derive(Deserialize)]
 struct SoloCurrentPayload {
     current: String,
+    /// 客户端是否要求 Server 也写 disk auth.json（client 模式 = true，
+    /// solo 模式 = false 仅归档 current 指针）。老客户端不传时默认 false 保留原行为。
+    #[serde(default)]
+    apply_to_disk: bool,
 }
 
 async fn handle_solo_current(
@@ -866,6 +871,7 @@ async fn handle_solo_current(
         }
     };
     let new_id = payload.current;
+    let apply_to_disk = payload.apply_to_disk;
     let (from_name, to_name) = {
         let mut store = match state.store.lock() {
             Ok(s) => s,
@@ -882,12 +888,17 @@ async fn handle_solo_current(
             .as_ref()
             .and_then(|id| store.accounts.get(id))
             .map(|a| a.name.clone());
-        // 用 switch_to 而不是只改 current 指针 —— Server 端如果也跑 Codex CLI，需要让它的
-        // ~/.codex/auth.json 跟着同步，否则两端 Codex 用不同账号容易撞 RT 轮换。
-        // 这里强制 cold（hot=false），因为 client 推过来的语义就是"两端都对齐到这个号"，
-        // 不应该被 Server 自己的 hot/cold 偏好覆盖。
-        if let Err(e) = store.switch_to(&new_id, false) {
-            return err_resp(format!("switch_to 失败: {}", e));
+        // 两种语义：
+        // - apply_to_disk=true（client 模式）：调 switch_to 写 disk，让 Server 这台机器
+        //   的 codex 也用同一个号工作（双端对齐）
+        // - apply_to_disk=false（solo 模式）：仅更新 current 指针归档，不写 disk，
+        //   尊重 Server 那边的独立工作状态
+        if apply_to_disk {
+            if let Err(e) = store.switch_to(&new_id, false) {
+                return err_resp(format!("switch_to 失败: {}", e));
+            }
+        } else {
+            store.current = Some(new_id.clone());
         }
         if let Err(e) = store.save() {
             return err_resp(format!("保存失败: {}", e));

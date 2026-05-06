@@ -15,6 +15,7 @@ interface DashboardProps {
     onRefreshUsage: () => void;
     onNavigateToAccounts: () => void;
     onExport: () => void;
+    proxyRunning?: boolean;
     syncStatus?: {
         is_synced: boolean;
         disk_email: string | null;
@@ -36,12 +37,16 @@ export function Dashboard({
     onRefreshUsage,
     onNavigateToAccounts,
     onExport,
+    proxyRunning,
     syncStatus,
     onSyncWithDisk,
     onImportDiskAccount,
     onForceOverwriteDisk,
 }: DashboardProps) {
+    // 切号现在永远写 disk auth.json（store ↔ disk 强一致），不一致仅出现在
+    // 用户在 codex 中手动改了登录状态、或 disk 文件被外部进程改动这种边角场景。
     const isMismatched = !!(syncStatus && !syncStatus.is_synced);
+    const isHarmless = isMismatched && proxyRunning;
     // 获取最佳账号推荐（配额最高的账号）
     const getBestAccount = () => {
         if (accounts.length === 0) return null;
@@ -63,20 +68,31 @@ export function Dashboard({
             {/* 统计卡片 */}
             <StatsBar accountCount={accounts.length} usage={usage} />
 
-            {/* 同步状态警告 */}
+            {/* 同步状态：proxy 在跑 → 仅信息提示；proxy 关 → 警告 */}
             {syncStatus && !syncStatus.is_synced && (
-                <div className="sync-warning-banner">
+                <div className={isHarmless ? 'sync-info-banner' : 'sync-warning-banner'}>
                     <div className="banner-content">
-                        <span className="banner-icon">⚠️</span>
+                        <span className="banner-icon">{isHarmless ? 'ℹ️' : '⚠️'}</span>
                         <div className="banner-text">
-                            <strong>登录状态不一致：</strong>
-                            检测到 IDE 正在使用 <span>{syncStatus.disk_email || '未知账号'}</span>
+                            {isHarmless ? (
+                                <>
+                                    <strong>磁盘 auth.json 落后：</strong>
+                                    停在 <span>{syncStatus.disk_email || '未知账号'}</span>
+                                    （代理正在注入当前激活号的 token，<b>不影响 codex 工作</b>；
+                                    关闭代理后 codex 会读到这个号）
+                                </>
+                            ) : (
+                                <>
+                                    <strong>登录状态不一致：</strong>
+                                    检测到 IDE 正在使用 <span>{syncStatus.disk_email || '未知账号'}</span>
+                                </>
+                            )}
                         </div>
                     </div>
                     <div className="banner-actions">
                         {syncStatus.matching_id ? (
                             <button className="btn btn-sm btn-accent" onClick={onSyncWithDisk}>
-                                修正激活状态
+                                {isHarmless ? '同步磁盘' : '修正激活状态'}
                             </button>
                         ) : (
                             <button className="btn btn-sm btn-primary" onClick={() => onImportDiskAccount(syncStatus.disk_email || '新账号')}>

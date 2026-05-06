@@ -188,7 +188,7 @@
     color: var(--primary-color);
 }
 
-/* 同步状态警告 */
+/* 同步状态警告（橙色，proxy 关闭时） */
 .sync-warning-banner {
     display: flex;
     align-items: center;
@@ -199,6 +199,33 @@
     border-radius: 10px;
     margin-bottom: 8px;
     animation: slideDown 0.3s ease-out;
+}
+
+/* 同步状态提示（蓝色，proxy 在跑时——只是信息，不影响工作） */
+.sync-info-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: rgba(59, 130, 246, 0.06);
+    border: 1px solid rgba(59, 130, 246, 0.2);
+    border-radius: 10px;
+    margin-bottom: 8px;
+    animation: slideDown 0.3s ease-out;
+}
+
+.sync-info-banner .banner-text strong {
+    color: #60a5fa;
+}
+
+.sync-info-banner .banner-text {
+    font-size: 12.5px;
+    color: var(--text-secondary);
+}
+
+.sync-info-banner .banner-text span {
+    font-family: monospace;
+    color: #93c5fd;
 }
 
 .banner-content {
