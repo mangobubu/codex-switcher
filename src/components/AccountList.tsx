@@ -1,7 +1,14 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud } from 'lucide-react';
-import { Account, AppSettings } from '../hooks/useAccounts';
+import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge } from 'lucide-react';
+import { Account, AppSettings, RelayUsageCache, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
+import { openUrl } from '@tauri-apps/plugin-opener';
+
+const KIND_BADGE: Record<ReturnType<typeof effectiveKind>, { label: string; className: string }> = {
+    chatgpt_oauth: { label: '订阅', className: 'badge kind-chatgpt' },
+    openai_key: { label: 'API', className: 'badge kind-openai' },
+    relay: { label: '中转', className: 'badge kind-relay' },
+};
 import { useShortCountdown } from '../hooks/useCountdown';
 import './AccountList.css';
 import { ConfirmModal } from './ConfirmModal';
@@ -19,7 +26,7 @@ interface UsageData {
     is_valid_for_cli: boolean;
 }
 
-type FilterType = 'all' | 'plus' | 'pro' | 'team' | 'free';
+type FilterType = 'all' | 'plus' | 'pro' | 'team' | 'free' | 'relay';
 
 interface AccountListProps {
     accounts: Account[];
@@ -59,6 +66,8 @@ export function AccountList({
     const [accountToDelete, setAccountToDelete] = useState<{ id: string, name: string } | null>(null);
     const [pushingIds, setPushingIds] = useState<Set<string>>(new Set());
     const [pushToast, setPushToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+    // Relay 类型账号的余额缓存（与 ChatGPT usage 独立）
+    const [relayUsageMap, setRelayUsageMap] = useState<Record<string, RelayUsageCache>>({});
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
@@ -75,6 +84,7 @@ export function AccountList({
         const initialUsage: Record<string, UsageData> = {};
         const initialInvalids = new Set<string>();
         const initialBanned = new Set<string>();
+        const initialRelayUsage: Record<string, RelayUsageCache> = {};
 
         accounts.forEach(acc => {
             if (acc.is_banned) {
@@ -82,6 +92,9 @@ export function AccountList({
                 initialInvalids.add(acc.id);
             } else if (acc.is_token_invalid || acc.is_logged_out) {
                 initialInvalids.add(acc.id);
+            }
+            if (acc.relay_usage_cache) {
+                initialRelayUsage[acc.id] = acc.relay_usage_cache;
             }
             if (acc.cached_quota) {
                 const isValid = acc.cached_quota.is_valid_for_cli !== false;
@@ -101,6 +114,7 @@ export function AccountList({
             }
         });
         setUsageMap(prev => ({ ...prev, ...initialUsage }));
+        setRelayUsageMap(prev => ({ ...prev, ...initialRelayUsage }));
         setInvalidIds(initialInvalids);
         setBannedIds(initialBanned);
     }, [accounts]);
@@ -113,6 +127,7 @@ export function AccountList({
 
         if (filter !== 'all') {
             result = result.filter(a => {
+                if (filter === 'relay') return effectiveKind(a) === 'relay';
                 const type = usageMap[a.id]?.plan_type?.toLowerCase() || '';
                 if (filter === 'pro') return type.includes('pro'); // 含 pro / prolite
                 if (filter === 'plus') return type.includes('plus');
@@ -125,8 +140,12 @@ export function AccountList({
     }, [accounts, searchQuery, filter, usageMap]);
 
     const filterCounts = useMemo(() => {
-        const counts = { all: accounts.length, pro: 0, plus: 0, team: 0, free: 0 };
+        const counts = { all: accounts.length, pro: 0, plus: 0, team: 0, free: 0, relay: 0 };
         accounts.forEach(a => {
+            if (effectiveKind(a) === 'relay') {
+                counts.relay++;
+                return;
+            }
             const type = usageMap[a.id]?.plan_type?.toLowerCase() || '';
             if (type.includes('pro')) counts.pro++;
             else if (type.includes('plus')) counts.plus++;
@@ -188,6 +207,14 @@ export function AccountList({
     const handleRefreshOne = async (id: string) => {
         setRefreshingIds(prev => new Set(prev).add(id));
         try {
+            // Relay 账号走专属 fetcher（不查 OpenAI usage）
+            const acc = accounts.find(a => a.id === id);
+            if (acc && effectiveKind(acc) === 'relay') {
+                const cache = await invoke<RelayUsageCache>('refresh_relay_usage', { id });
+                setRelayUsageMap(prev => ({ ...prev, [id]: cache }));
+                onRefreshComplete?.();
+                return;
+            }
             const cmd = settings.remote_mode === 'client'
                 ? 'remote_refresh_account_quota'
                 : 'get_quota_by_id';
@@ -210,6 +237,48 @@ export function AccountList({
         } finally {
             setRefreshingIds(prev => { const n = new Set(prev); n.delete(id); return n; });
         }
+    };
+
+    /// Relay 余额展示：
+    /// - unit 是 `%` → 进度条 mini-card（GLM 这种百分比模型）
+    /// - 其它（USD/CNY 等金额） → 纯文本 mini-card（unity2 等返回金额的）
+    const RelayQuotaItem = ({ cache }: { cache: RelayUsageCache | undefined }) => {
+        if (!cache) {
+            return (
+                <div className="quota-grid">
+                    <QuotaItem label="Token 配额" percentage={undefined} reset={undefined} />
+                </div>
+            );
+        }
+        const unit = cache.unit ?? '';
+        const isPercent = unit === '%' || unit.includes('%');
+        if (isPercent) {
+            return (
+                <div className="quota-grid">
+                    <QuotaItem
+                        label="Token 配额"
+                        percentage={cache.remaining}
+                        reset={cache.next_reset_at ? '' : undefined}
+                        resetAt={cache.next_reset_at ?? undefined}
+                    />
+                </div>
+            );
+        }
+        // 金额型：mini-card 风格但中间是数字+单位
+        const tone = cache.is_active ? 'green' : 'red';
+        return (
+            <div className="quota-grid">
+                <div className="quota-mini-card">
+                    <div className={`quota-mini-bg ${tone}`} style={{ width: '100%' }} />
+                    <div className="quota-mini-content">
+                        <span className="quota-label">余额</span>
+                        <span className={`quota-percent ${tone}`}>
+                            {cache.remaining.toFixed(2)} {unit}
+                        </span>
+                    </div>
+                </div>
+            </div>
+        );
     };
 
     const QuotaItem = ({ label, percentage, reset, resetAt }: { label: string, percentage: number | undefined, reset: string | undefined, resetAt?: number }) => {
@@ -248,41 +317,37 @@ export function AccountList({
                     <input type="text" placeholder="搜索邮箱..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
                 </div>
                 <div className="filter-group">
-                    {(['all', 'pro', 'plus', 'team', 'free'] as const).map(t => (
-                        <button key={t} className={`filter-btn ${filter === t ? 'active' : ''}`} onClick={() => setFilter(t)}>
-                            {t.toUpperCase()} <span className="filter-count">{filterCounts[t]}</span>
+                    {(['all', 'pro', 'plus', 'team', 'free', 'relay'] as const).map(t => (
+                        <button key={t} className={`filter-btn filter-btn-compact ${filter === t ? 'active' : ''}`} onClick={() => setFilter(t)}>
+                            {t.toUpperCase()}<span className="filter-count">{filterCounts[t]}</span>
                         </button>
                     ))}
                 </div>
                 <div className="toolbar-spacer" />
                 <button
-                    className={`btn-icon-text ${autoReload ? 'active-reload' : ''}`}
+                    className={`toolbar-icon-btn ${autoReload ? 'active-reload' : ''}`}
                     onClick={() => setAutoReload(!autoReload)}
-                    style={{
-                        marginRight: '12px',
-                        padding: '4px 8px',
-                        borderRadius: '4px',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '4px',
-                        background: autoReload ? 'var(--badge-bg)' : 'transparent',
-                        color: autoReload ? 'var(--primary-color)' : 'var(--text-muted)',
-                        border: '1px solid var(--border-color)'
-                    }}
+                    title={autoReload ? '关闭自动重载 IDE' : '开启自动重载 IDE'}
                 >
-                    <Zap size={14} fill={autoReload ? "currentColor" : "none"} />
-                    <span style={{ fontSize: '12px' }}>自动重载</span>
+                    <Zap size={16} fill={autoReload ? "currentColor" : "none"} />
                 </button>
                 {onAddAccount && (
-                    <button className="btn-icon-text" onClick={onAddAccount} style={{ marginRight: '8px', padding: '4px 10px', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', background: 'var(--primary-color)', color: 'white', border: 'none', fontSize: '12px' }}>
-                        + 添加
+                    <button
+                        className="toolbar-icon-btn toolbar-icon-btn-primary"
+                        onClick={onAddAccount}
+                        title="添加账号"
+                    >
+                        <Plus size={16} />
                     </button>
                 )}
                 {onRefreshUsage && (
-                    <button className="btn-icon-text" onClick={onRefreshUsage} disabled={usageLoading} style={{ marginRight: '8px', padding: '4px 10px', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', background: 'var(--accent-color)', color: 'white', border: 'none', fontSize: '12px' }}>
-                        <RefreshCw className={usageLoading ? 'spinning' : ''} size={12} />
-                        配额
+                    <button
+                        className="toolbar-icon-btn toolbar-icon-btn-accent"
+                        onClick={onRefreshUsage}
+                        disabled={usageLoading}
+                        title="刷新所有账号配额"
+                    >
+                        <Gauge className={usageLoading ? 'spinning' : ''} size={16} />
                     </button>
                 )}
                 <button className="btn-refresh" onClick={() => { setIsRefreshingAll(true); Promise.all(filteredAccounts.map(a => handleRefreshOne(a.id))).finally(() => setIsRefreshingAll(false)); }}>
@@ -320,9 +385,39 @@ export function AccountList({
                                     <input type="checkbox" className="custom-checkbox" checked={selectedIds.has(acc.id)} onChange={() => { const s = new Set(selectedIds); s.has(acc.id) ? s.delete(acc.id) : s.add(acc.id); setSelectedIds(s); }} />
                                 </div>
                                 <div className="col-drag"><span className="drag-handle">⋮⋮</span></div>
-                                <div className="col-email" onClick={() => handleCopy(acc.id, acc.name)} title="点击复制账号">
-                                    <span className="email-text">{acc.name}</span>
-                                    <div className="badges" style={{ display: 'flex', gap: '4px', marginLeft: '8px' }}>
+                                <div className="col-email" title="点击复制账号">
+                                    {(() => {
+                                        const isRelay = effectiveKind(acc) === 'relay';
+                                        const link = isRelay
+                                            ? (acc.relay_homepage || acc.relay_base_url || '')
+                                            : '';
+                                        const onNameClick = (e: React.MouseEvent) => {
+                                            // Relay：点击账号名打开主页/base_url；其它：复制
+                                            if (isRelay && link) {
+                                                e.stopPropagation();
+                                                openUrl(link).catch((err) => {
+                                                    console.error('openUrl failed:', err);
+                                                });
+                                            } else {
+                                                handleCopy(acc.id, acc.name);
+                                            }
+                                        };
+                                        return (
+                                            <span
+                                                className={isRelay ? 'email-text relay-name-link' : 'email-text'}
+                                                onClick={onNameClick}
+                                                title={isRelay && link ? `点击打开 ${link}` : undefined}
+                                            >
+                                                {acc.name}
+                                            </span>
+                                        );
+                                    })()}
+                                    <div className="badges" style={{ display: 'flex', gap: '4px', marginLeft: '8px', flexWrap: 'wrap' }}>
+                                        {(() => {
+                                            const k = effectiveKind(acc);
+                                            const meta = KIND_BADGE[k];
+                                            return <span className={meta.className}>{meta.label}</span>;
+                                        })()}
                                         {copiedId === acc.id && <span className="badge copy-success">已复制</span>}
                                         {isCurrent && <span className="badge current">当前</span>}
                                         {isBanned ? <span className="badge banned" title="该账号已被 OpenAI 封禁">封号</span> : isLoggedOut ? <span className="badge logged-out" title="您已登出或登录了其他账号，请重新登录">已登出</span> : isInvalid && <span className="badge expired" title="该账号 Token 已过期或失效">过期</span>}
@@ -330,7 +425,9 @@ export function AccountList({
                                     </div>
                                 </div>
                                 <div className="col-quota-merged">
-                                    {usage ? (
+                                    {effectiveKind(acc) === 'relay' ? (
+                                        <RelayQuotaItem cache={relayUsageMap[acc.id]} />
+                                    ) : usage ? (
                                         <div className="quota-grid">
                                             <QuotaItem label={usage.five_hour_label} percentage={usage.five_hour_left} reset={usage.five_hour_reset} resetAt={usage.five_hour_reset_at} />
                                             <QuotaItem label={usage.weekly_label} percentage={usage.weekly_left} reset={usage.weekly_reset} resetAt={usage.weekly_reset_at} />

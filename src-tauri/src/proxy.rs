@@ -394,9 +394,18 @@ async fn get_current_token(state: &ProxyState) -> Result<(String, bool), String>
 
     // 3) 默认路径：本地 store + ~/.codex/auth.json
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    if let Ok(disk_auth) = AccountStore::read_codex_auth() {
-        if store.sync_account_from_auth_json(&current_id, disk_auth) {
-            let _ = store.save();
+    // Relay 账号不与 disk auth.json 同步（disk 是 OAuth 身份，Relay 没 uid，
+    // 每次 sync 都会被 sync_account_from_auth_json_inner 的身份校验拒绝并刷一行 log）
+    let current_is_relay = store
+        .accounts
+        .get(&current_id)
+        .map(|a| a.is_relay())
+        .unwrap_or(false);
+    if !current_is_relay {
+        if let Ok(disk_auth) = AccountStore::read_codex_auth() {
+            if store.sync_account_from_auth_json(&current_id, disk_auth) {
+                let _ = store.save();
+            }
         }
     }
     let account = store.accounts.get(&current_id).ok_or("当前账号不存在")?;
@@ -420,9 +429,17 @@ async fn resolve_token_with_affinity(
     };
 
     // 1) 先看绑定的号是否健康（不依赖 quota，因为 cached_quota 可能滞后；只看 banned/logged_out/token_invalid）
+    // 此外：当 current 不是 Relay 但 binding 指向 Relay 时，按 relay_auto_switch_in 决定是否
+    // 用这条 binding——默认 false 即"不切到 Relay"，避免 affinity 把订阅号会话偷偷拉回 Relay 扣余额。
     let bound_account = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let cur = store.current.clone();
+        let cur_is_relay = cur
+            .as_deref()
+            .and_then(|id| store.accounts.get(id))
+            .map(|a| a.is_relay())
+            .unwrap_or(false);
+        let allow_in = store.settings.relay_auto_switch_in;
         let bid = state.session_affinity.lookup(sk, |id| {
             store
                 .accounts
@@ -431,7 +448,21 @@ async fn resolve_token_with_affinity(
                 .unwrap_or(false)
         });
         match bid {
-            Some(id) if Some(&id) != cur.as_ref() => Some(id),
+            Some(id) if Some(&id) != cur.as_ref() => {
+                let bound_is_relay = store
+                    .accounts
+                    .get(&id)
+                    .map(|a| a.is_relay())
+                    .unwrap_or(false);
+                if !allow_in && !cur_is_relay && bound_is_relay {
+                    println!(
+                        "[Proxy] affinity binding 指向 Relay 但 current 不是 Relay 且 relay_auto_switch_in=false，忽略 binding"
+                    );
+                    None
+                } else {
+                    Some(id)
+                }
+            }
             _ => None,
         }
     };
@@ -456,20 +487,102 @@ async fn resolve_token_with_affinity(
     Ok((tok, is_cgpt, cur))
 }
 
-/// 根据认证模式获取上游地址
-fn get_upstream(is_chatgpt: bool, path_and_query: &str) -> (String, &'static str) {
+/// 根据账号类型选定上游 URL 和 Host header。
+///
+/// - `is_chatgpt=true` → ChatGPT 订阅那条路径（去掉 `/v1` 前缀）
+/// - `is_chatgpt=false` + `relay_base_url=Some(b)` → 中转站 b + 原始 path
+/// - `is_chatgpt=false` + `relay_base_url=None` → 官方 api.openai.com + 原始 path
+fn get_upstream(
+    is_chatgpt: bool,
+    relay_base_url: Option<&str>,
+    path_and_query: &str,
+) -> (String, String) {
     if is_chatgpt {
         // 客户端路径: /v1/responses (因为 OPENAI_BASE_URL 带 /v1)
         // ChatGPT 上游: /backend-api/codex/responses (不含 /v1)
-        // 需要去掉 /v1 前缀
         let path = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
         let url = format!("{}{}", CHATGPT_ORIGIN, path);
-        (url, CHATGPT_HOST)
+        (url, CHATGPT_HOST.to_string())
+    } else if let Some(base) = relay_base_url {
+        // 中转站: 用账号上的 base_url + 原始 path（保留 /v1 前缀）
+        let base = base.trim_end_matches('/');
+        let host = url::Url::parse(base)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+            .unwrap_or_else(|| API_HOST.to_string());
+        (format!("{}{}", base, path_and_query), host)
     } else {
-        // API key: 转发到 api.openai.com + 原始路径（保留 /v1）
+        // 官方 API key: 转发到 api.openai.com + 原始路径（保留 /v1）
         let url = format!("{}{}", API_ORIGIN, path_and_query);
-        (url, API_HOST)
+        (url, API_HOST.to_string())
     }
+}
+
+/// 从 store 取指定账号的 relay_base_url（仅 Relay 类型；其它返回 None）。
+fn account_relay_base_url(state: &ProxyState, account_id: &str) -> Option<String> {
+    let store = state.store.lock().ok()?;
+    let acc = store.accounts.get(account_id)?;
+    if acc.is_relay() {
+        acc.relay_base_url.clone()
+    } else {
+        None
+    }
+}
+
+/// 中转站请求路由信息：当 store.current 是 Relay 时返回 Some。
+#[derive(Debug, Clone)]
+struct RelayRoute {
+    #[allow(dead_code)]
+    account_id: String,
+    model_map: Option<std::collections::HashMap<String, String>>,
+    model_fallback: Option<String>,
+}
+
+/// 取 store.current 的 Relay 路由信息（仅 Relay 类型；其它 None）。
+fn current_relay_route(state: &ProxyState) -> Option<RelayRoute> {
+    let store = state.store.lock().ok()?;
+    let id = store.current.clone()?;
+    let acc = store.accounts.get(&id)?;
+    if !acc.is_relay() {
+        return None;
+    }
+    Some(RelayRoute {
+        account_id: id,
+        model_map: acc.relay_model_map.clone(),
+        model_fallback: acc.relay_model_fallback.clone(),
+    })
+}
+
+/// 若 body 是 JSON 且含 `model` 字段，按 `map` / `fallback` 重写。
+///
+/// 优先级：map 命中 > fallback；都不命中或值跟原值相等 → 原样返回。
+fn rewrite_model_in_body(
+    body: &Bytes,
+    map: Option<&std::collections::HashMap<String, String>>,
+    fallback: Option<&str>,
+) -> Bytes {
+    if map.map_or(true, |m| m.is_empty()) && fallback.is_none() {
+        return body.clone();
+    }
+    let mut json: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return body.clone(), // 非 JSON 直接透传（流式上传等）
+    };
+    let original = match json.get("model").and_then(|v| v.as_str()) {
+        Some(m) => m.to_string(),
+        None => return body.clone(),
+    };
+    let target = map
+        .and_then(|m| m.get(&original).cloned())
+        .or_else(|| fallback.map(String::from));
+    if let Some(t) = target {
+        if t != original {
+            println!("[Proxy] Relay model rewrite: {} → {}", original, t);
+            json["model"] = serde_json::Value::String(t);
+            return Bytes::from(serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec()));
+        }
+    }
+    body.clone()
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -557,6 +670,11 @@ fn should_preemptive_switch(state: &ProxyState) -> bool {
         Some(a) => a,
         None => return false,
     };
+
+    // current 是 Relay 时，按设置决定是否允许预切走（401/429/quota 触发）
+    if account.is_relay() && !store.settings.relay_auto_switch_out {
+        return false;
+    }
 
     if account.is_banned || account.is_token_invalid || account.is_logged_out {
         println!("[Proxy] 发现当前账号被封禁/失效/登出，触发预防性切号");
@@ -812,10 +930,22 @@ async fn handle_request(
         }
     };
 
+    // ── Relay 路由前置处理 ──
+    // 1) 当 current 是 Relay 时，重写 body 里的 `model` 字段（codex 端发的 gpt-* → glm-*）
+    // 2) Relay 不能走 client→Server 转发：Server 不知道这账号，会一路 fall through 浪费时间
+    let relay_route = current_relay_route(&state);
+    let body_bytes = if let Some(ref r) = relay_route {
+        rewrite_model_in_body(&body_bytes, r.model_map.as_ref(), r.model_fallback.as_deref())
+    } else {
+        body_bytes
+    };
+
     // 提取 session_key：用于 affinity 路由 + cache hit 记账（client 模式 affinity 由 Server 处理）
     let session_key = crate::session_affinity::extract_session_key(&body_bytes, &req_headers);
 
     // ── client 模式：先转发到 Server；Server 不可达或返回 402 deactivated 时回退本地 ──
+    // Relay 账号也走这条 —— Server 端的 codex-switcher 知道 Relay schema，
+    // 收到请求后会按自己 store 里的 Relay base_url 转发到 unity2/glm 上游。
     let remote_mode = state
         .store
         .lock()
@@ -887,11 +1017,15 @@ async fn handle_request(
         _ => None,
     };
 
-    // 2. 根据认证模式路由上游
-    let (upstream_url, upstream_host) = get_upstream(is_chatgpt, &path_and_query);
+    // 2. 根据认证模式路由上游（Relay 类型从 used_account_id 查 base_url）
+    let relay_base_url = used_account_id
+        .as_deref()
+        .and_then(|id| account_relay_base_url(&state, id));
+    let (upstream_url, upstream_host) =
+        get_upstream(is_chatgpt, relay_base_url.as_deref(), &path_and_query);
 
     // 3. 透明 Header 转发（官方 responses-api-proxy 逻辑）
-    let base_headers = build_upstream_headers(&req_headers, upstream_host);
+    let base_headers = build_upstream_headers(&req_headers, &upstream_host);
 
     // 5. 首次转发
     let upstream_resp = match forward_with_token(
@@ -1471,6 +1605,22 @@ async fn try_switch_and_retry(
     session_key: Option<&str>,
     reason: SwitchReason,
 ) -> Option<Response<ProxyBody>> {
+    // current 是 Relay 时按设置决定 401/429 是否自动切走
+    {
+        let store = state.store.lock().ok();
+        let cur_is_relay = store
+            .as_ref()
+            .and_then(|s| s.current.clone())
+            .and_then(|id| store.as_ref().unwrap().accounts.get(&id).map(|a| a.is_relay()))
+            .unwrap_or(false);
+        let allow_out = store
+            .map(|s| s.settings.relay_auto_switch_out)
+            .unwrap_or(true);
+        if cur_is_relay && !allow_out {
+            println!("[Proxy] current 是 Relay 且 relay_auto_switch_out=false，不自动切（{:?}）", reason);
+            return None;
+        }
+    }
     for attempt in 0..MAX_429_RETRIES {
         match pick_next_account(state) {
             PickResult::Found { id, token } => {
@@ -1618,6 +1768,7 @@ async fn forward_to_server_parts(
     let proxy_base = derive_server_proxy_url(&api_base, proxy_port)
         .ok_or_else(|| format!("无法从 {} 构造 Server proxy URL", api_base))?;
     let upstream_url = format!("{}{}", proxy_base, path_and_query);
+    println!("[Proxy] → server forward: {} {}", method, upstream_url);
 
     let mut fwd_headers = reqwest::header::HeaderMap::new();
     for (name, value) in req_headers {
@@ -1668,10 +1819,12 @@ async fn try_local_fallback(
         return None;
     }
 
-    // 根据 token 形态路由上游
+    // 根据 token 形态路由上游（Relay 类型 sk- 不以 eyJ 开头，is_chatgpt 自然 false）
     let is_chatgpt = token.starts_with("eyJ");
-    let (upstream_url, upstream_host) = get_upstream(is_chatgpt, path_and_query);
-    let base_headers = build_upstream_headers(req_headers, upstream_host);
+    let relay_base_url = account_relay_base_url(state, &id);
+    let (upstream_url, upstream_host) =
+        get_upstream(is_chatgpt, relay_base_url.as_deref(), path_and_query);
+    let base_headers = build_upstream_headers(req_headers, &upstream_host);
     // 切号到新账号 → prompt_cache_key 拼 account_id + 剥 x-codex-turn-state
     let body_for_new = rewrite_prompt_cache_key(body, &id);
     let headers_no_ts = headers_without_turn_state(&base_headers);
@@ -1718,6 +1871,8 @@ async fn forward_with_token(
     if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
         headers.insert(reqwest::header::AUTHORIZATION, v);
     }
+
+    println!("[Proxy] → upstream: {} {}", method, upstream_url);
 
     state
         .client
@@ -2534,6 +2689,67 @@ fn build_stream_response(
     build_stream_response_from_parts(status, headers, Bytes::new(), stream, tracker, affinity_ctx)
 }
 
+// ────────────────────────────────────────────────────────────────
+// SSE 审查事件嗅探（采样阶段）
+// 目标：上游 SSE 里出现 OpenAI 内容审查信号（cybersecurity flag /
+// content_policy_violation / refusal / content_filter）时，把整段
+// SSE 体落盘到独立样本文件，便于后续写精准过滤。每条流第一次命中
+// 即 dump，避免巨流多次写盘；采样阶段不修改流本身。
+// ────────────────────────────────────────────────────────────────
+
+const MODERATION_SNIFF_KEYWORDS: &[&str] = &[
+    "flagged for possible cybersecurity",
+    "chatgpt.com/cyber",
+    "trusted access for cyber",
+    "content_policy_violation",
+    "content_filter",
+    "\"refusal\"",
+    "response.refusal",
+    "incomplete_details",
+];
+
+fn moderation_sniff_hit(window_lower: &str) -> Option<&'static str> {
+    MODERATION_SNIFF_KEYWORDS
+        .iter()
+        .copied()
+        .find(|kw| window_lower.contains(kw))
+}
+
+fn dump_moderation_sample(buf: Arc<Mutex<Vec<u8>>>, hit_kw: &'static str) {
+    tokio::spawn(async move {
+        let snapshot = match buf.lock() {
+            Ok(b) => b.clone(),
+            Err(_) => return,
+        };
+        let Some(home) = dirs::home_dir() else { return };
+        let dir = home.join(".codex-switcher").join("moderation-samples");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("[Proxy] moderation 样本目录创建失败: {}", e);
+            return;
+        }
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
+        let path = dir.join(format!("sample-{}.log", ts));
+        let header = format!(
+            "# moderation sniff hit: {}\n# captured_at: {}\n# bytes: {}\n# ───────────────────────────────────────────\n",
+            hit_kw,
+            chrono::Utc::now().to_rfc3339(),
+            snapshot.len()
+        );
+        let mut payload = Vec::with_capacity(header.len() + snapshot.len());
+        payload.extend_from_slice(header.as_bytes());
+        payload.extend_from_slice(&snapshot);
+        if let Err(e) = std::fs::write(&path, &payload) {
+            eprintln!("[Proxy] moderation 样本写盘失败: {}", e);
+            return;
+        }
+        println!(
+            "[Proxy] 命中审查关键词「{}」→ 样本已落盘: {}",
+            hit_kw,
+            path.display()
+        );
+    });
+}
+
 /// 同上，但允许传入已经缓冲的 prefix（bootstrap 阶段读到的字节），prefix 先发再接 rest。
 fn build_stream_response_from_parts(
     status: reqwest::StatusCode,
@@ -2567,6 +2783,25 @@ fn build_stream_response_from_parts(
     }
     let buf_clone = usage_buf.clone();
     let tracker_clone = tracker.clone();
+    // 仅 200 + SSE 才嗅探审查事件，其他状态码（4xx/5xx 错误体）跳过。
+    let moderation_sniff_enabled = status == reqwest::StatusCode::OK
+        && headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_lowercase().contains("event-stream"))
+            .unwrap_or(false);
+    let moderation_dumped = Arc::new(AtomicBool::new(false));
+    let moderation_dumped_clone = moderation_dumped.clone();
+    let moderation_buf_clone = usage_buf.clone();
+    // 命中后如果 prefix 里就有关键词，开流瞬间就 dump 一次（不等首个 chunk）
+    if moderation_sniff_enabled && !prefix.is_empty() {
+        let prefix_lower = String::from_utf8_lossy(&prefix).to_lowercase();
+        if let Some(kw) = moderation_sniff_hit(&prefix_lower) {
+            if !moderation_dumped.swap(true, Ordering::Relaxed) {
+                dump_moderation_sample(usage_buf.clone(), kw);
+            }
+        }
+    }
 
     // 把 prefix 当作流的第一个 chunk 先吐出去（空 prefix 时跳过）
     let prefix_stream: ByteStream = if prefix.is_empty() {
@@ -2588,6 +2823,22 @@ fn build_stream_response_from_parts(
         Ok(bytes) => {
             if let Ok(mut buf) = buf_clone.lock() {
                 buf.extend_from_slice(&bytes);
+                // 审查嗅探：每条 SSE 流第一次命中即异步 dump 整段 buf。
+                // 扫描窗口 = 新 chunk + 16KB 尾巴（防关键词跨 chunk 切断），
+                // 避免对整段缓冲做 O(n²) 重扫。
+                if moderation_sniff_enabled
+                    && !moderation_dumped_clone.load(Ordering::Relaxed)
+                {
+                    let tail_overlap = 16 * 1024;
+                    let scan_start = buf.len().saturating_sub(bytes.len() + tail_overlap);
+                    let window_lower =
+                        String::from_utf8_lossy(&buf[scan_start..]).to_lowercase();
+                    if let Some(kw) = moderation_sniff_hit(&window_lower) {
+                        if !moderation_dumped_clone.swap(true, Ordering::Relaxed) {
+                            dump_moderation_sample(moderation_buf_clone.clone(), kw);
+                        }
+                    }
+                }
             }
             Ok(Frame::data(bytes))
         }
@@ -2688,6 +2939,10 @@ async fn handle_websocket(
                     .accounts
                     .get(current_id)
                     .and_then(|a| {
+                        // current 是 Relay 时按设置决定是否预检切走
+                        if a.is_relay() && !store.settings.relay_auto_switch_out {
+                            return Some(false);
+                        }
                         if a.is_banned || a.is_token_invalid || a.is_logged_out {
                             return Some(true);
                         }
@@ -2799,12 +3054,20 @@ async fn handle_websocket(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
-    let (http_url, _upstream_host) = get_upstream(is_chatgpt, &path);
+    let relay_base_url = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.current.clone())
+        .and_then(|id| account_relay_base_url(&state, &id));
+    let (http_url, _upstream_host) =
+        get_upstream(is_chatgpt, relay_base_url.as_deref(), &path);
 
     // http(s):// → ws(s)://
     let ws_url = http_url
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
+    println!("[Proxy] → upstream WS: {}", ws_url);
 
     // 2. 构建上游 WebSocket 请求（透明 header 转发 + token 注入）
     let mut upstream_req: tungstenite::http::Request<()> =
@@ -2890,7 +3153,14 @@ async fn handle_websocket(
                         Err(_) => continue,
                     };
                     let cur_chatgpt = cur_token.starts_with("eyJ");
-                    let (cur_url, _) = get_upstream(cur_chatgpt, &path);
+                    let cur_relay = state
+                        .store
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.current.clone())
+                        .and_then(|id| account_relay_base_url(&state, &id));
+                    let (cur_url, _) =
+                        get_upstream(cur_chatgpt, cur_relay.as_deref(), &path);
                     let ws = cur_url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
                     if let Ok(mut r) = ws.as_str().into_client_request() {
                         for (n, v) in req.headers() {
@@ -2918,7 +3188,9 @@ async fn handle_websocket(
                         if let PickResult::Found { id, token: new_tok } = pick_next_account(&state) {
                             if do_switch(&state, &id, SwitchReason::WebSocketPrecheck).is_err() { continue; }
                             let new_chatgpt = new_tok.starts_with("eyJ");
-                            let (new_url, _) = get_upstream(new_chatgpt, &path);
+                            let new_relay = account_relay_base_url(&state, &id);
+                            let (new_url, _) =
+                                get_upstream(new_chatgpt, new_relay.as_deref(), &path);
                             let ws = new_url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
                             if let Ok(mut r) = ws.as_str().into_client_request() {
                                 for (n, v) in req.headers() {
@@ -2962,7 +3234,9 @@ async fn handle_websocket(
                         continue;
                     }
                     let new_chatgpt = new_tok.starts_with("eyJ");
-                    let (new_url, _) = get_upstream(new_chatgpt, &path);
+                    let new_relay = account_relay_base_url(&state, &id);
+                    let (new_url, _) =
+                        get_upstream(new_chatgpt, new_relay.as_deref(), &path);
                     let ws = new_url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
 
                     if let Ok(mut r) = ws.as_str().into_client_request() {
@@ -3470,4 +3744,59 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
                 .body(full_body(Bytes::from("internal error")))
                 .unwrap()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_chatgpt_strips_v1_prefix() {
+        let (url, host) = get_upstream(true, None, "/v1/responses");
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(host, "chatgpt.com");
+    }
+
+    #[test]
+    fn upstream_openai_keeps_v1_path() {
+        let (url, host) = get_upstream(false, None, "/v1/chat/completions");
+        assert_eq!(url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(host, "api.openai.com");
+    }
+
+    #[test]
+    fn upstream_relay_uses_base_url_with_full_path() {
+        let (url, host) =
+            get_upstream(false, Some("https://unity2.ai"), "/v1/chat/completions");
+        assert_eq!(url, "https://unity2.ai/v1/chat/completions");
+        assert_eq!(host, "unity2.ai");
+    }
+
+    #[test]
+    fn upstream_relay_strips_trailing_slash_on_base_url() {
+        let (url, host) =
+            get_upstream(false, Some("https://unity2.ai/"), "/v1/responses");
+        assert_eq!(url, "https://unity2.ai/v1/responses");
+        assert_eq!(host, "unity2.ai");
+    }
+
+    #[test]
+    fn upstream_relay_with_port_extracts_host_only() {
+        let (url, host) = get_upstream(
+            false,
+            Some("http://127.0.0.1:9080"),
+            "/v1/chat/completions",
+        );
+        assert_eq!(url, "http://127.0.0.1:9080/v1/chat/completions");
+        assert_eq!(host, "127.0.0.1");
+    }
+
+    #[test]
+    fn upstream_chatgpt_takes_precedence_over_relay_url() {
+        // 防呆：is_chatgpt=true 时 relay_base_url 应该被忽略（理论上不会同时设置，但要稳）
+        let (url, host) =
+            get_upstream(true, Some("https://unity2.ai"), "/v1/responses");
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(host, "chatgpt.com");
+    }
 }

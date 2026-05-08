@@ -378,7 +378,19 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
     let mut quota_refreshed = false;
     let mut quota_error: Option<String> = None;
 
-    let access_token = match access_token_opt {
+    // Relay 账号不走 OpenAI usage 接口（必然失败 + 错误地标 is_token_invalid）。
+    // Relay 余额由各 client 主动 refresh_relay_usage 拉取并展示，Server 不参与。
+    let is_relay = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.accounts.get(&id).map(|a| a.is_relay()))
+        .unwrap_or(false);
+
+    let access_token = if is_relay {
+        None // 跳过下面的 fetch_usage_direct 分支
+    } else {
+        match access_token_opt {
         Some(t) => Some(t),
         None => {
             if let Some(ref rt) = refresh_token {
@@ -407,6 +419,7 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                 quota_error = Some("无 access_token 且无 refresh_token".to_string());
                 None
             }
+        }
         }
     };
 
@@ -512,7 +525,7 @@ fn handle_delete(state: &ApiState, id: &str) -> Response<ResponseBody> {
 async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<ResponseBody> {
     let id = id.to_string();
 
-    let (access_token_opt, account_id, refresh_token) = {
+    let (access_token_opt, account_id, refresh_token, is_relay) = {
         let store = match state.store.lock() {
             Ok(s) => s,
             Err(e) => return err_resp(format!("锁获取失败: {}", e)),
@@ -524,6 +537,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                 a.refresh_token
                     .clone()
                     .or_else(|| AccountStore::extract_refresh_token(&a.auth_json)),
+                a.is_relay(),
             ),
             None => {
                 return json_resp(
@@ -533,6 +547,15 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
             }
         }
     };
+
+    // Relay 账号：Server 不查 OpenAI usage（会失败 + 误标 token_invalid）
+    // Relay 余额由 client 自己 refresh_relay_usage，Server 这里直接返回 ok。
+    if is_relay {
+        return json_resp(
+            StatusCode::OK,
+            json!({"ok": true, "skipped": "relay account; client-side refresh_relay_usage"}),
+        );
+    }
 
     let access_token = match access_token_opt {
         Some(t) => t,

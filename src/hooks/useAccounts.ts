@@ -24,6 +24,8 @@ export interface AppSettings {
     inactive_refresh_days: number;
     theme_palette: string;
     remote_mode?: string;
+    relay_auto_switch_out?: boolean;
+    relay_auto_switch_in?: boolean;
 }
 
 export interface KeepaliveState {
@@ -40,6 +42,16 @@ export interface SyncStatus {
     current_id: string | null;
 }
 
+export type AccountKind = 'legacy' | 'chatgpt_oauth' | 'openai_key' | 'relay';
+
+export interface RelayUsageCache {
+    remaining: number;
+    unit: string;
+    is_active: boolean;
+    next_reset_at?: number | null;
+    updated_at: string;
+}
+
 export interface Account {
     id: string;
     name: string;
@@ -52,6 +64,23 @@ export interface Account {
     is_banned: boolean;
     is_token_invalid: boolean;
     is_logged_out: boolean;
+    kind?: AccountKind;
+    relay_base_url?: string | null;
+    relay_homepage?: string | null;
+    relay_usage_preset?: string | null;
+    relay_usage_cache?: RelayUsageCache | null;
+    relay_model_map?: Record<string, string> | null;
+    relay_model_fallback?: string | null;
+}
+
+/** 解析有效 kind：与 Rust 端 `Account::effective_kind()` 行为一致
+ *  (Legacy 时按 auth_json 里的 access_token 前缀派生) */
+export function effectiveKind(account: Account): Exclude<AccountKind, 'legacy'> {
+    if (account.kind && account.kind !== 'legacy') return account.kind;
+    const auth = account.auth_json as { tokens?: { access_token?: string }; access_token?: string } | null;
+    const tok = auth?.tokens?.access_token ?? auth?.access_token;
+    if (typeof tok === 'string' && tok.startsWith('eyJ')) return 'chatgpt_oauth';
+    return 'openai_key';
 }
 
 export function useAccounts() {

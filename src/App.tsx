@@ -15,6 +15,7 @@ import { Stats } from './components/Stats';
 import { Skills } from './components/Skills';
 import CachePanel from './components/CachePanel';
 import { ConfirmModal } from './components/ConfirmModal';
+import { RelayImportConfirm } from './components/RelayImportConfirm';
 import './App.css';
 
 type PageType = 'dashboard' | 'accounts' | 'proxy' | 'stats' | 'cache' | 'skills' | 'settings';
@@ -466,6 +467,8 @@ function App() {
         extraActionText="以 IDE 为准 (同步状态)"
         onExtraAction={handleFollowIdeAction}
       />
+
+      <RelayImportConfirm />
     </div>
   );
 }

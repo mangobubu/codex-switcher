@@ -25,6 +25,8 @@ interface AppSettings {
     solo_auto_sync_current: boolean;
     proxy_bootstrap_byte_cap: number;
     proxy_bootstrap_time_cap_ms: number;
+    relay_auto_switch_out: boolean;
+    relay_auto_switch_in: boolean;
 }
 
 interface RemoteHealth {
@@ -64,6 +66,8 @@ export function Settings() {
         solo_auto_sync_current: true,
         proxy_bootstrap_byte_cap: 32 * 1024,
         proxy_bootstrap_time_cap_ms: 8000,
+        relay_auto_switch_out: true,
+        relay_auto_switch_in: false,
     });
     const [saving, setSaving] = useState(false);
     const [repairing, setRepairing] = useState(false);
@@ -274,6 +278,40 @@ export function Settings() {
                             type="checkbox"
                             checked={settings.allow_auto_switch_to_free}
                             onChange={e => updateField('allow_auto_switch_to_free', e.target.checked)}
+                        />
+                        <span className="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div className="setting-item">
+                    <div className="setting-info">
+                        <span className="setting-label">Relay 出问题时切回订阅号</span>
+                        <span className="setting-desc">
+                            开启（默认）：current 是 Relay 时，遇到 401/429/quota 自动切到健康的订阅号，避免请求卡死。关闭后 Relay 出错会把错误透传给客户端，不偷换。
+                        </span>
+                    </div>
+                    <label className="toggle">
+                        <input
+                            type="checkbox"
+                            checked={settings.relay_auto_switch_out ?? true}
+                            onChange={e => updateField('relay_auto_switch_out', e.target.checked)}
+                        />
+                        <span className="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div className="setting-item">
+                    <div className="setting-info">
+                        <span className="setting-label">自动选号可挑中 Relay</span>
+                        <span className="setting-desc">
+                            关闭（默认）：用订阅号时自动切号 / affinity 不会路由到 Relay，避免偷扣余额。开启后 Relay 跟订阅号同等参与轮询（量大但要确认你愿意花 Relay 的钱）。
+                        </span>
+                    </div>
+                    <label className="toggle">
+                        <input
+                            type="checkbox"
+                            checked={settings.relay_auto_switch_in ?? false}
+                            onChange={e => updateField('relay_auto_switch_in', e.target.checked)}
                         />
                         <span className="toggle-slider"></span>
                     </label>

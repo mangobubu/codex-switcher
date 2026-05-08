@@ -135,6 +135,16 @@ pub struct AppSettings {
     /// SSE bootstrap 的时间上限（毫秒）。配合 SSE keep-alive 心跳可以放心拉大。
     #[serde(default = "default_bootstrap_time_cap_ms")]
     pub proxy_bootstrap_time_cap_ms: u64,
+
+    /// Relay 账号"切回来"：current 是 Relay 时遇到 401/429/quota 是否允许自动切到其它（订阅）号
+    /// 默认 true —— Relay 出问题别卡死，可以救回订阅号
+    #[serde(default = "default_true")]
+    pub relay_auto_switch_out: bool,
+
+    /// "切到 Relay"：自动选号 / 切号 / affinity 是否允许选中 Relay 作为目标
+    /// 默认 false —— 用订阅号时不会偷偷把请求路由到 Relay 扣余额
+    #[serde(default = "default_false")]
+    pub relay_auto_switch_in: bool,
 }
 
 fn default_bootstrap_byte_cap() -> usize {
@@ -260,7 +270,32 @@ impl Default for AppSettings {
             solo_auto_sync_current: true,
             proxy_bootstrap_byte_cap: default_bootstrap_byte_cap(),
             proxy_bootstrap_time_cap_ms: default_bootstrap_time_cap_ms(),
+            relay_auto_switch_out: true,
+            relay_auto_switch_in: false,
         }
+    }
+}
+
+/// 账号类型
+///
+/// `Legacy` = 旧 store 里没显式标注的账号；运行时按 `auth_json` 里的 token 前缀派生
+/// （`eyJ...` JWT → ChatgptOauth；其它 → OpenaiKey）。新建账号必须显式给 kind。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKind {
+    /// 旧账号未标注，运行时派生
+    Legacy,
+    /// ChatGPT 订阅 OAuth（access_token JWT）
+    ChatgptOauth,
+    /// 官方 OpenAI API key（sk-...，上游 api.openai.com）
+    OpenaiKey,
+    /// 第三方中转站（sk-...，上游 = relay_base_url）
+    Relay,
+}
+
+impl Default for AccountKind {
+    fn default() -> Self {
+        Self::Legacy
     }
 }
 
@@ -300,6 +335,59 @@ pub struct Account {
     /// 该账号是否已登出
     #[serde(default)]
     pub is_logged_out: bool,
+
+    /// 账号类型；默认 `Legacy` 由 `effective_kind()` 按 token 派生（向后兼容旧 store）
+    #[serde(default)]
+    pub kind: AccountKind,
+
+    /// 中转站基址，仅 `Relay` 类型用，例 `"https://unity2.ai"`（不带尾斜杠）
+    #[serde(default)]
+    pub relay_base_url: Option<String>,
+
+    /// 中转站主页 URL（展示/打开用，可选）
+    #[serde(default)]
+    pub relay_homepage: Option<String>,
+
+    /// usage 拉取策略 preset 名（"openai_compat" 等内置 fetcher 名），None=不拉
+    #[serde(default)]
+    pub relay_usage_preset: Option<String>,
+
+    /// 中转站余额缓存
+    #[serde(default)]
+    pub relay_usage_cache: Option<RelayUsageCache>,
+
+    /// 模型名映射：客户端发的 model（如 `gpt-5.5`）→ 中转站实际 model（如 `glm-5.1`）。
+    /// 仅 Relay 类型生效；空映射 = 透传不替换。
+    #[serde(default)]
+    pub relay_model_map: Option<std::collections::HashMap<String, String>>,
+
+    /// 模型映射兜底：当 `relay_model_map` 不命中时统一替换成此值；None=透传。
+    #[serde(default)]
+    pub relay_model_fallback: Option<String>,
+}
+
+impl Account {
+    /// 解析有效 kind：`Legacy` 时按 token 前缀派生
+    pub fn effective_kind(&self) -> AccountKind {
+        match self.kind {
+            AccountKind::Legacy => match AccountStore::extract_access_token(&self.auth_json) {
+                Some(tok) if tok.starts_with("eyJ") => AccountKind::ChatgptOauth,
+                Some(_) => AccountKind::OpenaiKey,
+                None => AccountKind::OpenaiKey,
+            },
+            other => other,
+        }
+    }
+
+    /// 是否走 ChatGPT 订阅那条路径（chatgpt.com/backend-api/codex）
+    pub fn is_chatgpt_oauth(&self) -> bool {
+        self.effective_kind() == AccountKind::ChatgptOauth
+    }
+
+    /// 是否中转站账号
+    pub fn is_relay(&self) -> bool {
+        self.effective_kind() == AccountKind::Relay
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +415,22 @@ impl Default for KeepaliveState {
             last_error: None,
         }
     }
+}
+
+/// 中转站账号的余额缓存（与 `CachedQuota` 平行；语义上一个是 USD 余额，一个是 5h+周窗口）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayUsageCache {
+    /// 剩余额度（原始数值；单位看 `unit`）
+    pub remaining: f64,
+    /// 单位字符串（"USD" / "CNY" / "USDcent" / "tokens" 等，由上游决定）
+    pub unit: String,
+    /// 上游报告的账号是否仍然可用
+    pub is_active: bool,
+    /// 下次重置时间（Unix 秒；GLM 端是 nextResetTime/1000；None=无重置概念）
+    #[serde(default)]
+    pub next_reset_at: Option<i64>,
+    /// 抓取时刻
+    pub updated_at: DateTime<Utc>,
 }
 
 /// 缓存的配额信息
@@ -436,8 +540,46 @@ impl AccountStore {
         if store.backfill_refresh_tokens() {
             let _ = store.save();
         }
+        if store.migrate_glm_usage_preset() {
+            let _ = store.save();
+        }
 
         store
+    }
+
+    /// 一次性迁移：把已导入的 GLM 账号（base_url 含 `bigmodel.cn`）的
+    /// `relay_usage_preset` 从 `openai_compat` 改成 `glm_zhipu`，并补上 model 映射兜底
+    /// （codex 端发的 gpt-* 模型 GLM 不认识，需要替换成 glm-* 系列）。
+    fn migrate_glm_usage_preset(&mut self) -> bool {
+        let mut changed = false;
+        for acc in self.accounts.values_mut() {
+            if !matches!(acc.kind, AccountKind::Relay) {
+                continue;
+            }
+            let base = acc.relay_base_url.as_deref().unwrap_or("");
+            if !base.contains("bigmodel.cn") {
+                continue;
+            }
+            if acc.relay_usage_preset.as_deref() == Some("openai_compat") {
+                acc.relay_usage_preset = Some("glm_zhipu".to_string());
+                acc.relay_usage_cache = None; // 清掉旧错值
+                changed = true;
+                println!(
+                    "[Migration] GLM 账号 {} usage_preset: openai_compat → glm_zhipu",
+                    acc.name
+                );
+            }
+            // 补默认模型映射：旧版本没这个字段，导致 codex 发 gpt-5.5 → GLM 直接 404
+            if acc.relay_model_fallback.is_none() && acc.relay_model_map.is_none() {
+                acc.relay_model_fallback = Some("glm-5.1".to_string());
+                changed = true;
+                println!(
+                    "[Migration] GLM 账号 {} 补默认 model_fallback=glm-5.1",
+                    acc.name
+                );
+            }
+        }
+        changed
     }
 
     /// 保存账号存储
@@ -535,6 +677,13 @@ impl AccountStore {
             is_banned: false,
             is_token_invalid: false,
             is_logged_out: false,
+            kind: AccountKind::Legacy,
+            relay_base_url: None,
+            relay_homepage: None,
+            relay_usage_preset: None,
+            relay_usage_cache: None,
+            relay_model_map: None,
+            relay_model_fallback: None,
         };
 
         self.accounts.insert(id.clone(), account.clone());
@@ -544,6 +693,60 @@ impl AccountStore {
             self.current = Some(id);
         }
 
+        account
+    }
+
+    /// 添加中转站账号（Relay 类型）。
+    ///
+    /// 不同于 OAuth/官方 API key：sk- 永久有效、不可 refresh、上游打 base_url。
+    pub fn add_relay_account(
+        &mut self,
+        name: String,
+        base_url: String,
+        api_key: String,
+        homepage: Option<String>,
+        usage_preset: Option<String>,
+        notes: Option<String>,
+        model_map: Option<std::collections::HashMap<String, String>>,
+        model_fallback: Option<String>,
+    ) -> Account {
+        let id = uuid::Uuid::new_v4().to_string();
+        let normalized_base = base_url.trim().trim_end_matches('/').to_string();
+        let auth_json = serde_json::json!({
+            "tokens": {
+                "access_token": api_key,
+                // account_id 仅做内部唯一性占位，UI 显示用 name
+                "account_id": format!("relay:{}", id),
+            },
+            "last_refresh": Utc::now().to_rfc3339(),
+        });
+
+        let account = Account {
+            id: id.clone(),
+            name,
+            auth_json,
+            refresh_token: None,
+            created_at: Utc::now(),
+            last_used: None,
+            notes,
+            cached_quota: None,
+            keepalive: KeepaliveState::default(),
+            is_banned: false,
+            is_token_invalid: false,
+            is_logged_out: false,
+            kind: AccountKind::Relay,
+            relay_base_url: Some(normalized_base),
+            relay_homepage: homepage,
+            relay_usage_preset: usage_preset,
+            relay_usage_cache: None,
+            relay_model_map: model_map,
+            relay_model_fallback: model_fallback,
+        };
+
+        self.accounts.insert(id.clone(), account.clone());
+        if self.current.is_none() {
+            self.current = Some(id);
+        }
         account
     }
 

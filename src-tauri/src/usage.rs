@@ -352,4 +352,308 @@ impl UsageFetcher {
             "即将重置".to_string()
         }
     }
+
+    /// 中转站 OpenAI 兼容 usage：`GET {base}/v1/usage` with `Authorization: Bearer <key>`
+    ///
+    /// 字段优先级（cc-switch 通用模板兼容）：
+    /// - remaining: `remaining` / `quota.remaining` / `balance`
+    /// - unit:      `unit` / `quota.unit` / 默认 `"USD"`
+    /// - is_active: `is_active` / `isValid` / 默认 `true`
+    pub async fn fetch_relay_usage_openai_compat(
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<crate::account::RelayUsageCache, String> {
+        let url = format!("{}/v1/usage", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("usage 请求失败: {}", e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // 带上 URL + body 前 200 字节，方便定位（如 GLM 401 会返回中文"令牌过期"）
+            let body_preview = resp
+                .text()
+                .await
+                .map(|s| s.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            return Err(format!(
+                "HTTP {} @ {} → {}",
+                status.as_u16(),
+                url,
+                body_preview
+            ));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("usage JSON 解析失败: {}", e))?;
+
+        let remaining = body
+            .get("remaining")
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                body.get("quota")
+                    .and_then(|q| q.get("remaining"))
+                    .and_then(|v| v.as_f64())
+            })
+            .or_else(|| body.get("balance").and_then(|v| v.as_f64()))
+            .ok_or_else(|| "上游响应缺 remaining/balance 字段".to_string())?;
+
+        let unit = body
+            .get("unit")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                body.get("quota")
+                    .and_then(|q| q.get("unit"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("USD")
+            .to_string();
+
+        let is_active = body
+            .get("is_active")
+            .and_then(|v| v.as_bool())
+            .or_else(|| body.get("isValid").and_then(|v| v.as_bool()))
+            .unwrap_or(true);
+
+        Ok(crate::account::RelayUsageCache {
+            remaining,
+            unit,
+            is_active,
+            next_reset_at: None,
+            updated_at: chrono::Utc::now(),
+        })
+    }
+
+    /// GLM / 智谱 monitor quota：`GET https://<host>/api/monitor/usage/quota/limit` with Bearer。
+    ///
+    /// 输入 `base_url` 通常是 OpenAI 兼容根（如 `https://open.bigmodel.cn/api/paas/v4`），
+    /// 这里只取 origin，再拼 `/api/monitor/usage/quota/limit`。
+    ///
+    /// 响应：
+    /// ```json
+    /// {"code":200,"data":{"limits":[
+    ///   {"type":"TIME_LIMIT","percentage":30,"remaining":0.7,"nextResetTime":1234567890000},
+    ///   {"type":"TOKENS_LIMIT","percentage":50}
+    /// ]}}
+    /// ```
+    /// 我们把 TOKENS_LIMIT 的 `100 - percentage` 当 `remaining`，单位 `"% tokens"`。
+    pub async fn fetch_relay_usage_glm_zhipu(
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<crate::account::RelayUsageCache, String> {
+        let origin = url::Url::parse(base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| {
+                let scheme = u.scheme();
+                let port = u.port().map(|p| format!(":{}", p)).unwrap_or_default();
+                format!("{}://{}{}", scheme, h, port)
+            }))
+            .ok_or_else(|| format!("无法从 base_url 解析 origin: {}", base_url))?;
+
+        let url = format!("{}/api/monitor/usage/quota/limit", origin);
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("usage 请求失败: {}", e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_preview = resp
+                .text()
+                .await
+                .map(|s| s.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            return Err(format!(
+                "HTTP {} @ {} → {}",
+                status.as_u16(),
+                url,
+                body_preview
+            ));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("usage JSON 解析失败: {}", e))?;
+
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+        if code != 200 {
+            let msg = body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("non-200 code");
+            return Err(format!("GLM code={} msg={}", code, msg));
+        }
+
+        // 从 limits 数组里捞 TOKENS_LIMIT 的 percentage
+        let tokens_pct = body
+            .get("data")
+            .and_then(|d| d.get("limits"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|lim| {
+                    let kind = lim.get("type").and_then(|v| v.as_str())?;
+                    if kind == "TOKENS_LIMIT" {
+                        lim.get("percentage").and_then(|v| v.as_f64())
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        // 计算 remaining 百分比（用 tokens 维度；优先级：TOKENS_LIMIT > TIME_LIMIT > 100）
+        let used_pct = tokens_pct.or_else(|| {
+            body.get("data")
+                .and_then(|d| d.get("limits"))
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter().find_map(|lim| {
+                        lim.get("percentage").and_then(|v| v.as_f64())
+                    })
+                })
+        }).unwrap_or(0.0);
+        let remaining_pct = (100.0 - used_pct).max(0.0);
+
+        // 取 nextResetTime（毫秒时间戳）→ Unix 秒
+        let next_reset_at = body
+            .get("data")
+            .and_then(|d| d.get("limits"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|lim| {
+                    lim.get("nextResetTime").and_then(|v| v.as_i64())
+                })
+            })
+            .map(|ms| ms / 1000);
+
+        Ok(crate::account::RelayUsageCache {
+            remaining: remaining_pct,
+            unit: "%".to_string(),
+            is_active: remaining_pct > 0.0,
+            next_reset_at,
+            updated_at: chrono::Utc::now(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse_relay_response(body: Value) -> Result<(f64, String, bool), String> {
+        // 单元测试只验证字段优先级，不实际打网络
+        let remaining = body
+            .get("remaining")
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                body.get("quota")
+                    .and_then(|q| q.get("remaining"))
+                    .and_then(|v| v.as_f64())
+            })
+            .or_else(|| body.get("balance").and_then(|v| v.as_f64()))
+            .ok_or_else(|| "missing".to_string())?;
+        let unit = body
+            .get("unit")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                body.get("quota")
+                    .and_then(|q| q.get("unit"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("USD")
+            .to_string();
+        let is_active = body
+            .get("is_active")
+            .and_then(|v| v.as_bool())
+            .or_else(|| body.get("isValid").and_then(|v| v.as_bool()))
+            .unwrap_or(true);
+        Ok((remaining, unit, is_active))
+    }
+
+    #[test]
+    fn relay_usage_top_level_fields() {
+        let body = json!({"remaining": 12.5, "unit": "USD", "is_active": true});
+        let (r, u, a) = parse_relay_response(body).unwrap();
+        assert_eq!(r, 12.5);
+        assert_eq!(u, "USD");
+        assert!(a);
+    }
+
+    #[test]
+    fn relay_usage_nested_quota() {
+        let body = json!({"quota": {"remaining": 8.0, "unit": "CNY"}, "isValid": false});
+        let (r, u, a) = parse_relay_response(body).unwrap();
+        assert_eq!(r, 8.0);
+        assert_eq!(u, "CNY");
+        assert!(!a);
+    }
+
+    #[test]
+    fn relay_usage_balance_alias_with_default_unit() {
+        let body = json!({"balance": 1.23});
+        let (r, u, a) = parse_relay_response(body).unwrap();
+        assert_eq!(r, 1.23);
+        assert_eq!(u, "USD"); // 默认
+        assert!(a); // 默认
+    }
+
+    #[test]
+    fn relay_usage_missing_remaining_errors() {
+        let body = json!({"unit": "USD"});
+        assert!(parse_relay_response(body).is_err());
+    }
+
+    fn parse_glm_quota(body: Value) -> Option<f64> {
+        // 模拟 fetch_relay_usage_glm_zhipu 的解析步骤（不打网络）
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+        if code != 200 {
+            return None;
+        }
+        let used_pct = body
+            .get("data")
+            .and_then(|d| d.get("limits"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|lim| {
+                    let kind = lim.get("type").and_then(|v| v.as_str())?;
+                    if kind == "TOKENS_LIMIT" {
+                        lim.get("percentage").and_then(|v| v.as_f64())
+                    } else {
+                        None
+                    }
+                })
+            })?;
+        Some((100.0 - used_pct).max(0.0))
+    }
+
+    #[test]
+    fn glm_quota_picks_tokens_limit_percentage() {
+        let body = json!({
+            "code": 200,
+            "data": {
+                "limits": [
+                    {"type": "TIME_LIMIT", "percentage": 30, "remaining": 0.7},
+                    {"type": "TOKENS_LIMIT", "percentage": 25}
+                ]
+            }
+        });
+        let pct = parse_glm_quota(body).unwrap();
+        assert_eq!(pct, 75.0); // 100 - 25
+    }
+
+    #[test]
+    fn glm_quota_skips_when_code_not_200() {
+        let body = json!({"code": 401, "message": "unauthorized"});
+        assert!(parse_glm_quota(body).is_none());
+    }
 }

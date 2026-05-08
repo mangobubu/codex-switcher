@@ -115,6 +115,75 @@
     flex: 1;
 }
 
+/* 紧凑 filter 按钮（label·count 内联，省 toolbar 宽度） */
+.filter-btn-compact {
+    gap: 4px;
+    padding: 5px 8px;
+}
+
+.filter-btn-compact .filter-count {
+    padding: 1px 5px;
+    font-size: 10px;
+    line-height: 1.4;
+}
+
+/* 工具栏右侧 icon-only 按钮（替代之前的"+ 添加 / 配额 / 自动重载" 文字按钮） */
+.toolbar-icon-btn {
+    width: 30px;
+    height: 30px;
+    margin-left: 6px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    flex-shrink: 0;
+}
+
+.toolbar-icon-btn:hover {
+    color: var(--text-primary);
+    background: var(--hover-bg);
+}
+
+.toolbar-icon-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.toolbar-icon-btn.active-reload {
+    background: var(--badge-bg);
+    color: var(--primary-color);
+    border-color: var(--primary-color);
+}
+
+.toolbar-icon-btn-primary {
+    background: var(--primary-color);
+    color: #fff;
+    border-color: var(--primary-color);
+}
+
+.toolbar-icon-btn-primary:hover {
+    background: var(--primary-color);
+    color: #fff;
+    filter: brightness(1.1);
+}
+
+.toolbar-icon-btn-accent {
+    background: var(--accent-color, #22c55e);
+    color: #fff;
+    border-color: var(--accent-color, #22c55e);
+}
+
+.toolbar-icon-btn-accent:hover {
+    color: #fff;
+    filter: brightness(1.1);
+}
+
 /* 自定义复选框 */
 .custom-checkbox {
     appearance: none;
@@ -627,4 +696,63 @@
     to {
         transform: rotate(360deg);
     }
+}
+
+/* ── 中转站类型 badge & 余额展示 ── */
+.badge.kind-chatgpt {
+    background: rgba(16, 163, 127, 0.14);
+    color: #10a37f;
+}
+
+.badge.kind-openai {
+    background: rgba(59, 130, 246, 0.14);
+    color: #3b82f6;
+}
+
+.badge.kind-relay {
+    background: rgba(168, 85, 247, 0.16);
+    color: #a855f7;
+}
+
+.relay-base-url {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 280px;
+}
+
+.relay-balance {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+}
+
+.relay-balance-amount {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-weight: 600;
+}
+
+.relay-balance-amount.ok {
+    color: var(--success-color, #22c55e);
+}
+
+.relay-balance-amount.bad {
+    color: #dc2626;
+    text-decoration: line-through;
+}
+
+.email-text.relay-name-link {
+    cursor: pointer;
+    text-decoration: underline dotted transparent;
+    transition: color 0.15s ease, text-decoration-color 0.15s ease;
+}
+
+.email-text.relay-name-link:hover {
+    color: var(--primary-color, #3b82f6);
+    text-decoration-color: var(--primary-color, #3b82f6);
 }

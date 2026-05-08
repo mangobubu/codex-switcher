@@ -4,6 +4,7 @@
 
 mod account;
 mod bulk_import;
+mod deep_link;
 mod ide_control;
 pub mod mailbox;
 pub mod oauth;
@@ -656,6 +657,147 @@ fn bulk_import_accounts(
 }
 
 /// 导入账号配置
+/// 添加中转站账号（手动表单 / deep link 共用）。
+///
+/// `base_url` 必须是 `http(s)://` 完整 URL；保存时尾斜杠会被去除。
+/// `usage_preset` 命中内置 fetcher 名（如 `"openai_compat"`），None=不拉 usage。
+#[tauri::command]
+async fn add_relay_account(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    name: String,
+    base_url: String,
+    api_key: String,
+    homepage: Option<String>,
+    usage_preset: Option<String>,
+    notes: Option<String>,
+    model_map: Option<std::collections::HashMap<String, String>>,
+    model_fallback: Option<String>,
+) -> Result<Account, String> {
+    let trimmed_url = base_url.trim();
+    if !(trimmed_url.starts_with("https://") || trimmed_url.starts_with("http://")) {
+        return Err("base_url 必须以 http:// 或 https:// 开头".to_string());
+    }
+    if api_key.trim().is_empty() {
+        return Err("api_key 不能为空".to_string());
+    }
+    if name.trim().is_empty() {
+        return Err("name 不能为空".to_string());
+    }
+
+    let (account, should_push) = {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        let acc = store.add_relay_account(
+            name.trim().to_string(),
+            trimmed_url.to_string(),
+            api_key.trim().to_string(),
+            homepage.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()),
+            usage_preset.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
+            notes,
+            model_map,
+            model_fallback.map(|f| f.trim().to_string()).filter(|f| !f.is_empty()),
+        );
+        store.save()?;
+        let push = account::pushes_to_server(&store.settings.remote_mode);
+        (acc, push)
+    };
+
+    // client/solo 模式：把新建的 Relay 账号推到 Server，让 mini mac 也持有。
+    // 这样 fast_auth_sync / quota_refresh 不会把这个账号当"本地残留"删掉。
+    if should_push {
+        match client_settings_snapshot(&state).await {
+            Ok((url, secret)) => {
+                let snapshot = state
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.accounts.get(&account.id).cloned());
+                if let Some(acc_snapshot) = snapshot {
+                    match remote_client::upsert_account(&url, &secret, &acc_snapshot).await {
+                        Ok(outcome) => println!(
+                            "[Relay] upsert to server: id={} status={}",
+                            outcome.id, outcome.upserted
+                        ),
+                        Err(e) => eprintln!(
+                            "[Relay] 推送 Server 失败（账号已本地保存）: {}",
+                            e
+                        ),
+                    }
+                }
+            }
+            Err(e) => eprintln!("[Relay] 读取 client 配置失败，未推送 Server: {}", e),
+        }
+    }
+
+    crate::tray::update_tray_menu(&app);
+    Ok(account)
+}
+
+/// 更新 Relay 账号的模型映射 / 兜底（编辑功能用）。
+#[tauri::command]
+fn update_relay_model_map(
+    state: State<AppState>,
+    id: String,
+    model_map: Option<std::collections::HashMap<String, String>>,
+    model_fallback: Option<String>,
+) -> Result<(), String> {
+    let mut store = state.store.lock().map_err(|e| e.to_string())?;
+    let acc = store
+        .accounts
+        .get_mut(&id)
+        .ok_or_else(|| format!("账号 {} 不存在", id))?;
+    if !acc.is_relay() {
+        return Err("不是中转站账号".to_string());
+    }
+    acc.relay_model_map = model_map;
+    acc.relay_model_fallback = model_fallback
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty());
+    store.save()?;
+    Ok(())
+}
+
+/// 主动刷新中转站账号的余额（用户点 UI 刷新按钮时调）。
+///
+/// 仅 Relay 类型可用。fetcher 由 `relay_usage_preset` 字段选定；为空时默认 `openai_compat`。
+#[tauri::command]
+async fn refresh_relay_usage(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<account::RelayUsageCache, String> {
+    let (base_url, api_key, preset) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let acc = store.accounts.get(&id).ok_or("账号不存在")?;
+        if !acc.is_relay() {
+            return Err("不是中转站账号".into());
+        }
+        let base = acc.relay_base_url.clone().ok_or("中转站账号缺 base_url")?;
+        let key = AccountStore::extract_access_token(&acc.auth_json)
+            .ok_or("中转站账号缺 api_key")?;
+        let preset = acc.relay_usage_preset.clone();
+        (base, key, preset)
+    };
+
+    let cache = match preset.as_deref() {
+        Some("openai_compat") | None => {
+            UsageFetcher::fetch_relay_usage_openai_compat(&base_url, &api_key).await?
+        }
+        Some("glm_zhipu") => {
+            UsageFetcher::fetch_relay_usage_glm_zhipu(&base_url, &api_key).await?
+        }
+        Some(other) => return Err(format!("未支持的 usage_preset: {}", other)),
+    };
+
+    {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        if let Some(acc) = store.accounts.get_mut(&id) {
+            acc.relay_usage_cache = Some(cache.clone());
+            store.save()?;
+        }
+    }
+    Ok(cache)
+}
+
 #[tauri::command]
 fn import_accounts(
     state: State<AppState>,
@@ -1059,6 +1201,14 @@ async fn switch_account(
         }
     }
 
+    // 0.5 提前判断 Relay 类型 —— 用于跳过 OpenAI usage 预检
+    let is_target_relay = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.accounts.get(&id).map(|a| a.is_relay()))
+        .unwrap_or(false);
+
     // 1. 获取目标账号的校验凭据
     let (target_id, access_token, refresh_token, account_id) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
@@ -1146,6 +1296,9 @@ async fn switch_account(
 
     // 2. 预检（非阻断）：仅尝试读取配额缓存，不触发本地 refresh_token 刷新。
     // 失败不阻断切换，交由 Codex 在实际请求中按需维护 token 生命周期。
+    if is_target_relay {
+        println!("[Switch] Relay 类型，跳过 OpenAI usage 预检: {}", target_id);
+    } else {
     println!(
         "[Switch] 预检目标账号配额（不触发本地 refresh）: {}",
         target_id
@@ -1178,6 +1331,7 @@ async fn switch_account(
             println!("[Switch] 预检配额失败（忽略，不阻断切换）: {}", e);
         }
     }
+    } // end if !is_target_relay
 
     // 3. 执行切换：根据 switch_mode + 代理运行状态决定热/冷切
     let proxy_running = state
@@ -1572,6 +1726,8 @@ pub fn start_quota_refresh(
                                             }
                                         }
                                         // 2) 删除 Server 上已不存在的账号（多端删号同步）
+                                        // Relay 账号也参与 prune：add_relay_account 现在会 upsert 到 Server，
+                                        // Server 上有这账号就不会被 prune。
                                         let local_ids: Vec<String> =
                                             s.accounts.keys().cloned().collect();
                                         for id in local_ids {
@@ -1591,8 +1747,7 @@ pub fn start_quota_refresh(
                                 //    - 拉 Server 最新 token
                                 //    - 写本机 store（accounts.json） + 官方 ~/.codex/auth.json
                                 //    - 更新本机 current 指针
-                                //    规则：若 Server 正常，本机始终跟随 Server 的 current，
-                                //    避免本机 Codex CLI 自己 refresh 同一账号的 refresh_token 造成双端分叉。
+                                //    规则：若 Server 正常，本机始终跟随 Server 的 current。
                                 if let Ok(cur) =
                                     crate::remote_client::get_current(&base, &secret).await
                                 {
@@ -1691,12 +1846,15 @@ pub fn start_quota_refresh(
             }
 
             // 按 cached_quota.updated_at 排序，最旧的优先
+            // Relay 账号的 quota 通过专属 fetcher 拉取，这里跳过避免无谓打 OpenAI usage API
             let targets: Vec<(String, String)> = {
                 let s = store.lock().unwrap();
                 let mut accounts: Vec<_> = s
                     .accounts
                     .values()
-                    .filter(|a| !a.is_banned && !a.is_token_invalid && !a.is_logged_out)
+                    .filter(|a| {
+                        !a.is_banned && !a.is_token_invalid && !a.is_logged_out && !a.is_relay()
+                    })
                     .map(|a| {
                         let updated = a
                             .cached_quota
@@ -1844,6 +2002,7 @@ pub fn start_quota_refresh(
 pub fn score_candidate_accounts(store: &AccountStore) -> Vec<(String, String, f64)> {
     let current_id = store.current.as_deref().unwrap_or("");
     let allow_free = store.settings.allow_auto_switch_to_free;
+    let allow_switch_in_relay = store.settings.relay_auto_switch_in;
     let now = chrono::Utc::now().timestamp();
 
     let mut scored: Vec<(String, String, f64)> = Vec::new();
@@ -1854,6 +2013,10 @@ pub fn score_candidate_accounts(store: &AccountStore) -> Vec<(String, String, f6
             || account.is_token_invalid
             || account.is_logged_out
         {
+            continue;
+        }
+        // 默认不"切到 Relay"：自动选号跳过 Relay 候选
+        if !allow_switch_in_relay && account.is_relay() {
             continue;
         }
 
@@ -1941,6 +2104,18 @@ pub async fn switch_to_next_account_internal(
     for (target_id, target_name, score) in &candidates {
         println!("[SmartSwitch] 候选: {} (评分 {:.0})", target_name, score);
 
+        // Relay 类型不走 OpenAI usage API（中转站不支持），直接接受候选
+        let is_relay = state
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| s.accounts.get(target_id).map(|a| a.is_relay()))
+            .unwrap_or(false);
+        if is_relay {
+            println!("[SmartSwitch] Relay 类型，跳过 quota 检查直接切换: {}", target_name);
+            return switch_account(state, app.clone(), target_id.clone()).await;
+        }
+
         // 查 API 确认最新额度
         let quota = match get_quota_internal(&state, target_id.clone()).await {
             Ok(u) => u,
@@ -1986,6 +2161,17 @@ pub async fn switch_to_next_account_internal(
 
 /// 内部辅助：获取额度数据
 async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay, String> {
+    // Relay 账号没有 OpenAI 5h+周窗口模型；上层应改用 refresh_relay_usage
+    {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        if let Some(acc) = store.accounts.get(&id) {
+            if acc.is_relay() {
+                return Err(
+                    "RELAY_ACCOUNT:中转站账号不支持 OpenAI usage 查询，请用「中转站余额刷新」".to_string()
+                );
+            }
+        }
+    }
     let (access_token, account_id, refresh_token) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let account = store.accounts.get(&id).ok_or("账号不存在")?;
@@ -2140,6 +2326,18 @@ async fn get_quota_by_id(
     app: tauri::AppHandle,
     id: String,
 ) -> Result<UsageDisplay, String> {
+    // Relay 账号：不走 OpenAI usage 路径
+    {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        if let Some(acc) = store.accounts.get(&id) {
+            if acc.is_relay() {
+                return Err(
+                    "RELAY_ACCOUNT:中转站账号请用「中转站余额刷新」，不是 OpenAI usage".to_string()
+                );
+            }
+        }
+    }
+
     // 当前激活账号：先按 ~/.codex/auth.json 做身份校验与同步，再继续走 API 查询配额
     let is_current = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
@@ -3392,8 +3590,34 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_deep_link::init())
         .manage(AppState::new())
         .setup(|app| {
+            // ── Deep link 监听：codexswitch:// + ccswitch:// ──
+            // 收到 URL 后解析，把结果 emit 到前端"deep-link://import-pending"事件，
+            // 由前端弹确认框，用户点"导入"才会调 add_relay_account 落库。
+            use tauri_plugin_deep_link::DeepLinkExt;
+            let dl_handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    let url_str = url.to_string();
+                    match deep_link::parse(&url_str) {
+                        Ok(payload) => {
+                            println!("[DeepLink] 解析成功: {} → {}", payload.source, payload.name);
+                            if let Some(window) = dl_handle.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                            if let Err(e) = dl_handle.emit("deep-link://import-pending", &payload) {
+                                eprintln!("[DeepLink] emit 失败: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[DeepLink] 解析失败 ({}): {}", url_str, e);
+                        }
+                    }
+                }
+            });
             // 初始化系统托盘
             if let Err(e) = tray::init(app.handle()) {
                 eprintln!("初始化托盘失败: {:?}", e);
@@ -3502,6 +3726,63 @@ pub fn run() {
                     println!("[FastAuthSync] 启动时同步完成");
                 }
             });
+
+            // 启动时把本地已有 Relay 账号 upsert 到 Server（升级路径迁移）
+            // 旧版 add_relay_account 没 push 到 Server，新版 prune 不再特殊跳过 Relay，
+            // 不预先 push 一次会被下一轮 quota_refresh 当残留删掉。
+            let store_for_relay = state.store.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                let (mode, primary, fallback, secret) = {
+                    let s = match store_for_relay.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    (
+                        s.settings.remote_mode.clone(),
+                        s.settings.remote_server_url.clone(),
+                        s.settings.remote_server_url_fallback.clone(),
+                        s.settings.remote_shared_secret.clone(),
+                    )
+                };
+                if !account::pushes_to_server(&mode) || secret.is_empty() {
+                    return;
+                }
+                let url = match remote_client::resolve_base_url(&primary, &fallback).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[RelayPushOnStart] Server 不可达，跳过: {}", e);
+                        return;
+                    }
+                };
+                let relays: Vec<Account> = match store_for_relay.lock() {
+                    Ok(s) => s
+                        .accounts
+                        .values()
+                        .filter(|a| a.is_relay())
+                        .cloned()
+                        .collect(),
+                    Err(_) => return,
+                };
+                if relays.is_empty() {
+                    return;
+                }
+                println!(
+                    "[RelayPushOnStart] 把 {} 个本地 Relay 账号 upsert 到 Server",
+                    relays.len()
+                );
+                for acc in relays {
+                    match remote_client::upsert_account(&url, &secret, &acc).await {
+                        Ok(o) => println!(
+                            "[RelayPushOnStart] {} → {} ({})",
+                            acc.name, o.id, o.upserted
+                        ),
+                        Err(e) => {
+                            eprintln!("[RelayPushOnStart] {} 失败: {}", acc.name, e)
+                        }
+                    }
+                }
+            });
             // 快速 auth.json 同步循环（client 模式专用，但循环内自检模式，可以无脑启动）
             let _fast_auth_handle = start_fast_auth_sync(state.store.clone());
 
@@ -3567,6 +3848,9 @@ pub fn run() {
             set_account_inactive_refresh_enabled,
             export_accounts,
             import_accounts,
+            add_relay_account,
+            update_relay_model_map,
+            refresh_relay_usage,
             bulk_import_accounts,
             check_codex_login,
             get_quota_by_id,
@@ -3658,6 +3942,13 @@ mod tests {
             is_banned: false,
             is_token_invalid: false,
             is_logged_out: false,
+            kind: account::AccountKind::Legacy,
+            relay_base_url: None,
+            relay_homepage: None,
+            relay_usage_preset: None,
+            relay_usage_cache: None,
+            relay_model_map: None,
+            relay_model_fallback: None,
         }
     }
 

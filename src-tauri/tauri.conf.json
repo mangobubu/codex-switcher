@@ -14,8 +14,8 @@
     "windows": [
       {
         "title": "Codex Switcher",
-        "width": 1024,
-        "height": 700,
+        "width": 1200,
+        "height": 760,
         "resizable": true,
         "center": true
       }
@@ -34,5 +34,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["codexswitch", "ccswitch"]
+      }
+    }
   }
 }

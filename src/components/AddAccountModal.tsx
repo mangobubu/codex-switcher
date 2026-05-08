@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { listen, emit } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { readFile } from '@tauri-apps/plugin-fs';
 import { useAccounts } from '../hooks/useAccounts';
+import { RELAY_PRESETS } from '../data/relay_presets';
 import './AddAccountModal.css';
 
 function statusIcon(status: string): string {
@@ -23,7 +24,7 @@ interface AddAccountModalProps {
     onSuccess?: () => void;  // 添加成功后的回调，用于刷新父组件列表
 }
 
-type TabType = 'official' | 'openai' | 'otp_batch' | 'bulk';
+type TabType = 'official' | 'openai' | 'otp_batch' | 'bulk' | 'relay';
 
 interface BulkImportSummary {
     format: string;
@@ -181,6 +182,92 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
         entries: OtpEntry[];
         rowIndices: number[];
     } | null>(null);
+    // 中转站（Relay）
+    const [relayPresetId, setRelayPresetId] = useState<string>(RELAY_PRESETS[0]?.id ?? 'custom');
+    const [relayName, setRelayName] = useState<string>(RELAY_PRESETS[0]?.name ?? '');
+    const [relayBaseUrl, setRelayBaseUrl] = useState<string>(RELAY_PRESETS[0]?.base_url ?? '');
+    const [relayApiKey, setRelayApiKey] = useState<string>('');
+    const [relayUsagePreset, setRelayUsagePreset] = useState<string | null>(
+        RELAY_PRESETS[0]?.usage_preset ?? null,
+    );
+    const [relayModelFallback, setRelayModelFallback] = useState<string>(
+        RELAY_PRESETS[0]?.model_fallback ?? '',
+    );
+    // 模型映射用 textarea（"key=value\n..." 格式）展示给用户编辑
+    const [relayModelMapText, setRelayModelMapText] = useState<string>(() => {
+        const m = RELAY_PRESETS[0]?.model_map;
+        return m ? Object.entries(m).map(([k, v]) => `${k}=${v}`).join('\n') : '';
+    });
+    const [relaySubmitting, setRelaySubmitting] = useState(false);
+    const [relayError, setRelayError] = useState<string | null>(null);
+
+    const handlePickRelayPreset = (id: string) => {
+        const preset = RELAY_PRESETS.find(p => p.id === id);
+        setRelayPresetId(id);
+        if (preset) {
+            setRelayName(preset.name);
+            setRelayBaseUrl(preset.base_url);
+            setRelayUsagePreset(preset.usage_preset ?? null);
+            setRelayModelFallback(preset.model_fallback ?? '');
+            const m = preset.model_map ?? {};
+            setRelayModelMapText(Object.entries(m).map(([k, v]) => `${k}=${v}`).join('\n'));
+        }
+        setRelayError(null);
+    };
+
+    /** 把 textarea 文本解析成 { key: value }，忽略空行 / 注释 / 不含 = 的行 */
+    const parseModelMapText = (text: string): Record<string, string> => {
+        const out: Record<string, string> = {};
+        for (const line of text.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const eq = trimmed.indexOf('=');
+            if (eq <= 0) continue;
+            const k = trimmed.slice(0, eq).trim();
+            const v = trimmed.slice(eq + 1).trim();
+            if (k && v) out[k] = v;
+        }
+        return out;
+    };
+
+    const handleSubmitRelay = async () => {
+        setRelayError(null);
+        if (!relayName.trim()) {
+            setRelayError('账号名不能为空');
+            return;
+        }
+        if (!/^https?:\/\//.test(relayBaseUrl.trim())) {
+            setRelayError('Base URL 必须以 http:// 或 https:// 开头');
+            return;
+        }
+        if (relayApiKey.trim().length < 8) {
+            setRelayError('API Key 看起来太短');
+            return;
+        }
+        setRelaySubmitting(true);
+        try {
+            const preset = RELAY_PRESETS.find(p => p.id === relayPresetId);
+            const modelMap = parseModelMapText(relayModelMapText);
+            await invoke('add_relay_account', {
+                name: relayName.trim(),
+                baseUrl: relayBaseUrl.trim(),
+                apiKey: relayApiKey.trim(),
+                homepage: preset?.homepage ?? null,
+                usagePreset: relayUsagePreset ?? null,
+                notes: `from preset:${relayPresetId}`,
+                modelMap: Object.keys(modelMap).length > 0 ? modelMap : null,
+                modelFallback: relayModelFallback.trim() || null,
+            });
+            await emit('accounts-updated');
+            // 重置表单
+            setRelayApiKey('');
+            handleClose();
+        } catch (e) {
+            setRelayError(typeof e === 'string' ? e : String(e));
+        } finally {
+            setRelaySubmitting(false);
+        }
+    };
 
     // 监听后端发来的授权码
     useEffect(() => {
@@ -421,7 +508,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
     return (
         <div className="modal-overlay" onClick={handleClose}>
             <div
-                className={`modal-content${activeTab === 'otp_batch' ? ' modal-wide' : ''}`}
+                className={`modal-content${activeTab === 'otp_batch' || activeTab === 'relay' ? ' modal-wide' : ''}`}
                 onClick={e => e.stopPropagation()}
             >
                 <div className="modal-header">
@@ -455,6 +542,12 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                             onClick={() => !loading && !otpRunning && setActiveTab('bulk')}
                         >
                             批量导入文件
+                        </button>
+                        <button
+                            className={`tab-item ${activeTab === 'relay' ? 'active' : ''}`}
+                            onClick={() => !loading && !otpRunning && setActiveTab('relay')}
+                        >
+                            中转站
                         </button>
                     </div>
                 </div>
@@ -629,6 +722,127 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                     共 {otpRows.length}
                                 </div>
                             )}
+                        </div>
+                    ) : activeTab === 'relay' ? (
+                        <div className="relay-panel">
+                            <p className="modal-tip" style={{ marginBottom: 12 }}>
+                                选预设自动填 base_url，贴 sk-key 即可。也支持 <code>codexswitch://</code> deep link。
+                            </p>
+
+                            <div className="relay-form-grid">
+                            <div className="form-group form-group-full">
+                                <label htmlFor="relay-preset">预设</label>
+                                <select
+                                    id="relay-preset"
+                                    value={relayPresetId}
+                                    onChange={e => handlePickRelayPreset(e.target.value)}
+                                    disabled={relaySubmitting}
+                                >
+                                    {RELAY_PRESETS.map(p => (
+                                        <option key={p.id} value={p.id}>
+                                            {p.name}{p.description ? ` — ${p.description}` : ''}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <div className="form-group">
+                                <label htmlFor="relay-name">账号名称 *</label>
+                                <input
+                                    id="relay-name"
+                                    type="text"
+                                    value={relayName}
+                                    onChange={e => setRelayName(e.target.value)}
+                                    disabled={relaySubmitting}
+                                    placeholder="例如：unity2-工作"
+                                />
+                            </div>
+
+                            <div className="form-group">
+                                <label htmlFor="relay-base">Base URL *</label>
+                                <input
+                                    id="relay-base"
+                                    type="text"
+                                    value={relayBaseUrl}
+                                    onChange={e => setRelayBaseUrl(e.target.value)}
+                                    disabled={relaySubmitting}
+                                    placeholder="https://unity2.ai"
+                                    style={{ fontFamily: 'ui-monospace, Menlo, monospace' }}
+                                />
+                            </div>
+
+                            <div className="form-group">
+                                <label htmlFor="relay-key">API Key (sk-...) *</label>
+                                <input
+                                    id="relay-key"
+                                    type="password"
+                                    value={relayApiKey}
+                                    onChange={e => setRelayApiKey(e.target.value)}
+                                    disabled={relaySubmitting}
+                                    placeholder="sk-..."
+                                    style={{ fontFamily: 'ui-monospace, Menlo, monospace' }}
+                                />
+                            </div>
+
+                            <div className="form-group">
+                                <label htmlFor="relay-usage">余额查询策略</label>
+                                <select
+                                    id="relay-usage"
+                                    value={relayUsagePreset ?? ''}
+                                    onChange={e => setRelayUsagePreset(e.target.value || null)}
+                                    disabled={relaySubmitting}
+                                >
+                                    <option value="">不拉取</option>
+                                    <option value="openai_compat">openai_compat (GET /v1/usage)</option>
+                                    <option value="glm_zhipu">glm_zhipu (GLM 自家 quota 接口)</option>
+                                </select>
+                            </div>
+
+                            <div className="form-group">
+                                <label htmlFor="relay-model-fallback">
+                                    模型兜底 <span style={{ color: 'var(--text-muted)', fontWeight: 'normal', fontSize: 12 }}>
+                                        客户端发的 model 没命中映射时，统一替换成这个
+                                    </span>
+                                </label>
+                                <input
+                                    id="relay-model-fallback"
+                                    type="text"
+                                    value={relayModelFallback}
+                                    onChange={e => setRelayModelFallback(e.target.value)}
+                                    disabled={relaySubmitting}
+                                    placeholder="如 glm-5.1（留空 = 透传不替换）"
+                                    style={{ fontFamily: 'ui-monospace, Menlo, monospace' }}
+                                />
+                            </div>
+
+                            <div className="form-group form-group-full">
+                                <label htmlFor="relay-model-map">
+                                    模型映射表 <span style={{ color: 'var(--text-muted)', fontWeight: 'normal', fontSize: 12 }}>
+                                        每行 <code>客户端model=中转站model</code>
+                                    </span>
+                                </label>
+                                <textarea
+                                    id="relay-model-map"
+                                    value={relayModelMapText}
+                                    onChange={e => setRelayModelMapText(e.target.value)}
+                                    disabled={relaySubmitting}
+                                    rows={3}
+                                    placeholder={'gpt-5.5=glm-5.1\ngpt-4o=glm-5\ngpt-4o-mini=glm-5.1-x'}
+                                    style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12, width: '100%' }}
+                                />
+                            </div>
+                            </div>{/* end relay-form-grid */}
+
+                            {relayError && <div className="error-message">{relayError}</div>}
+
+                            <div className="modal-footer" style={{ padding: '16px 0 0', border: 'none' }}>
+                                <button type="button" className="btn btn-ghost" onClick={handleClose} disabled={relaySubmitting}>
+                                    取消
+                                </button>
+                                <button type="button" className="btn btn-primary" onClick={handleSubmitRelay} disabled={relaySubmitting}>
+                                    {relaySubmitting ? '导入中…' : '导入中转站'}
+                                </button>
+                            </div>
                         </div>
                     ) : activeTab === 'official' ? (
                         <form onSubmit={handleSubmitOfficial}>
