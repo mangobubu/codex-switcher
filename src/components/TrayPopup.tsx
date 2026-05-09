@@ -137,10 +137,17 @@ export function TrayPopup() {
     const handleRefresh = async () => {
         try {
             const currentId = await invoke<string | null>('get_current_account_id');
-            if (currentId) {
+            if (!currentId) return;
+            // Relay 账号走 refresh_relay_usage（GLM 等），订阅号走 OpenAI usage 路径。
+            const accounts = await invoke<Array<{ id: string; kind?: string }>>('get_accounts');
+            const acc = accounts.find(a => a.id === currentId);
+            const isRelay = (acc?.kind ?? '').toLowerCase() === 'relay';
+            if (isRelay) {
+                await invoke('refresh_relay_usage', { id: currentId });
+            } else {
                 await invoke('get_quota_by_id', { id: currentId });
-                await fetchData();
             }
+            await fetchData();
         } catch (e) {
             console.error('Refresh failed:', e);
         }

@@ -974,14 +974,16 @@ async fn handle_request(
     let session_key = crate::session_affinity::extract_session_key(&body_bytes, &req_headers);
 
     // ── client 模式：先转发到 Server；Server 不可达或返回 402 deactivated 时回退本地 ──
-    // Relay 账号也走这条 —— Server 端的 codex-switcher 知道 Relay schema，
-    // 收到请求后会按自己 store 里的 Relay base_url 转发到 unity2/glm 上游。
+    // 注意：Relay 账号不再走 Server。Relay 用 API key 直连上游，没有账号池/保活/401-切号
+    // 那套需求，多一跳 LAN 纯加延迟。让 Relay 在 client 机器本地直接打上游
+    // （chat_completions 协议已在更上游分支返回；responses 协议落到下面 get_upstream
+    // 直发 unity2/packycode）。
     let remote_mode = state
         .store
         .lock()
         .map(|s| s.settings.remote_mode.clone())
         .unwrap_or_default();
-    if remote_mode == "client" {
+    if remote_mode == "client" && relay_route.is_none() {
         match forward_to_server_parts(&state, &method, &path_and_query, &req_headers, &body_bytes)
             .await
         {
@@ -4048,12 +4050,91 @@ async fn handle_chat_completions_relay(
     }
 
     // 翻译请求体
-    let model = extract_model_from_body(&body_bytes);
+    if body_bytes.is_empty() {
+        eprintln!(
+            "[Proxy] relay translate 收到空 body | method={} path={} headers.content_type={:?} content_length={:?}",
+            method,
+            path_and_query,
+            req_headers.get(hyper::header::CONTENT_TYPE),
+            req_headers.get(hyper::header::CONTENT_LENGTH),
+        );
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "translator: empty request body on /v1/responses (expected codex Responses payload)",
+        );
+    }
+    // codex CLI 0.130+ 默认 zstd 压缩 request body（也可能 gzip）。先按 Content-Encoding 解压。
+    let content_encoding = req_headers
+        .get(hyper::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase());
+    let body_for_translate: Bytes = match content_encoding.as_deref() {
+        Some("zstd") | Some("x-zstd") => match zstd::decode_all(body_bytes.as_ref()) {
+            Ok(out) => Bytes::from(out),
+            Err(e) => {
+                eprintln!("[Proxy] relay translate zstd 解压失败: {} body_len={}", e, body_bytes.len());
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("translator: zstd decompress failed: {}", e),
+                );
+            }
+        },
+        Some("gzip") | Some("x-gzip") => {
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(body_bytes.as_ref());
+            let mut out = Vec::with_capacity(body_bytes.len() * 4);
+            match decoder.read_to_end(&mut out) {
+                Ok(_) => Bytes::from(out),
+                Err(e) => {
+                    eprintln!("[Proxy] relay translate gzip 解压失败: {} body_len={}", e, body_bytes.len());
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("translator: gzip decompress failed: {}", e),
+                    );
+                }
+            }
+        }
+        Some("deflate") => {
+            use std::io::Read;
+            let mut decoder = flate2::read::DeflateDecoder::new(body_bytes.as_ref());
+            let mut out = Vec::with_capacity(body_bytes.len() * 4);
+            match decoder.read_to_end(&mut out) {
+                Ok(_) => Bytes::from(out),
+                Err(e) => {
+                    eprintln!("[Proxy] relay translate deflate 解压失败: {}", e);
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("translator: deflate decompress failed: {}", e),
+                    );
+                }
+            }
+        }
+        _ => body_bytes.clone(),
+    };
+    // codex CLI 0.130+ 把 body 用 zstd 压缩 → 顶层 rewrite_model_in_body 那次没改成
+    // （它在解压之前跑，JSON 解析失败原样返回）。这里解压后必须再 rewrite 一次，
+    // 否则上游会收到 codex 的 gpt-5.5 / gpt-5-codex 报"模型不存在"。
+    let body_for_translate = rewrite_model_in_body(
+        &body_for_translate,
+        relay.model_map.as_ref(),
+        relay.model_fallback.as_deref(),
+    );
+    let model = extract_model_from_body(&body_for_translate);
     let (chat_body, mut translator_state) =
-        match crate::relay_translate::translate_request(&body_bytes, &model) {
+        match crate::relay_translate::translate_request(&body_for_translate, &model) {
             Ok(x) => x,
             Err(e) => {
-                eprintln!("[Proxy] relay translate 请求失败: {}", e);
+                let head_len = body_for_translate.len().min(160);
+                let head_str = String::from_utf8_lossy(&body_for_translate[..head_len]);
+                eprintln!(
+                    "[Proxy] relay translate 请求失败: {} | method={} path={} encoding={:?} body_len={} body_head={:?}",
+                    e,
+                    method,
+                    path_and_query,
+                    content_encoding,
+                    body_for_translate.len(),
+                    head_str,
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     &format!("translator 请求处理失败: {}", e),
@@ -4079,6 +4160,9 @@ async fn handle_chat_completions_relay(
         headers.insert(reqwest::header::CONTENT_TYPE, ct);
     }
     headers.remove(reqwest::header::CONTENT_LENGTH);
+    // 我们已经把客户端的 zstd/gzip 请求体解压并重新编码成 plain JSON，
+    // 必须把原 Content-Encoding 头去掉，否则上游会按 zstd 再尝试解码失败。
+    headers.remove(reqwest::header::CONTENT_ENCODING);
 
     let body_bytes_chat = Bytes::from(chat_body);
     println!(

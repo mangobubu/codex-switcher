@@ -616,6 +616,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dirs 5.0.1",
+ "flate2",
  "futures-util",
  "http-body-util",
  "hyper",
@@ -640,6 +641,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "zip",
+ "zstd",
 ]
 
 [[package]]

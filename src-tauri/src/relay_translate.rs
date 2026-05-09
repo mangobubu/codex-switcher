@@ -655,7 +655,19 @@ fn transform_payload(payload: &mut Value) {
                             }
                         }));
                     }
-                    _ => transformed.push(tool),
+                    other => {
+                        // codex CLI sends private tool types (local_shell, apply_patch,
+                        // custom_tool, etc.) that GLM rejects with "type is illegal".
+                        // Match the Python reference (zai_provider.py) and silently
+                        // drop them — codex CLI also exposes a regular `function`-typed
+                        // `shell` tool that GLM can call, then we remap the call_id back
+                        // to local_shell_call shape in the response stream.
+                        eprintln!(
+                            "[relay_translate] drop non-GLM tool type={:?} name={:?}",
+                            other,
+                            tool.get("name").or_else(|| tool.pointer("/function/name")),
+                        );
+                    }
                 }
             }
             *arr = transformed;
