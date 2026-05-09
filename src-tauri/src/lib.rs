@@ -3134,6 +3134,34 @@ fn get_sync_status(state: State<AppState>) -> Result<SyncStatus, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let disk_email = AccountStore::extract_email(&disk_auth);
 
+    // Relay 短路：current 是中转账号 + 磁盘 auth.json 是 ApiKey schema
+    // (`{"OPENAI_API_KEY": "..."}`，无 tokens 块、无 email) 是这次 v0.5.1
+    // 改造后的"对路"状态——如果两边 api_key 串相等就是已同步，不要按 OAuth
+    // email 比对路径走（那条会报"未知账号身份不匹配"误报）。
+    if let Some(curr_id) = store.current.as_ref() {
+        if let Some(curr_acc) = store.accounts.get(curr_id) {
+            if curr_acc.is_relay() {
+                let curr_api_key = curr_acc
+                    .auth_json
+                    .pointer("/tokens/access_token")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let disk_api_key = disk_auth
+                    .get("OPENAI_API_KEY")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !curr_api_key.is_empty() && curr_api_key == disk_api_key {
+                    return Ok(SyncStatus {
+                        is_synced: true,
+                        disk_email: None,
+                        matching_id: store.current.clone(),
+                        current_id: store.current.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     // 快速路径：先检查磁盘 auth 与当前激活账号是否身份一致
     // 这解决了 JWT 过期/损坏导致 email 提取失败的误报问题
     let current_matches_disk = store
