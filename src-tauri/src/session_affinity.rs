@@ -77,13 +77,17 @@ impl SessionAffinity {
         Some(entry.account_id)
     }
 
-    /// 记录一次"该 session 在该账号上确认拿到 cache 命中"（cached_tokens > 0）
-    /// 这是 evidence-based stickiness 的核心：没看到证据就不记，避免把请求黏到一个根本没缓存
-    /// 的号上。
+    /// 记录一次响应完成（response.completed），把 session 黏到当前号上。
+    ///
+    /// 原本是 "evidence-based"：只在 `cached_tokens > 0` 时才记。但 codex 的
+    /// `prompt_cache_key = thread_id` 跨 turn 稳定（codex-rs/core/src/client.rs:742
+    /// 已验证），首轮必然 cold cache `cached_tokens=0`；如果非要等到第二轮看见命中
+    /// 才记 binding，那中间任何一次 quota 抖动 / 切号都会把这个会话推到别的号上，
+    /// 第二轮的"命中证据"永远等不到。
+    ///
+    /// 改成：响应一完成就记 binding（不要求 cache 命中），让后续请求能稳定回到
+    /// 同一个号建/复用 cache。`cached_tokens` 仅用作统计累加。
     pub fn record_cache_hit(&self, session_key: &str, account_id: &str, cached_tokens: i64) {
-        if cached_tokens <= 0 {
-            return;
-        }
         let mut g = match self.bindings.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -95,7 +99,10 @@ impl SessionAffinity {
                     e.last_hit_at = Instant::now();
                 }
                 e.hit_count = e.hit_count.saturating_add(1);
-                e.total_cached_tokens = e.total_cached_tokens.saturating_add(cached_tokens);
+                if cached_tokens > 0 {
+                    e.total_cached_tokens =
+                        e.total_cached_tokens.saturating_add(cached_tokens);
+                }
             }
             _ => {
                 // 切到新账号 / 第一次记 → 覆盖（也可以保留两槽 stable+recent 但先简单实现）
@@ -106,11 +113,22 @@ impl SessionAffinity {
                         first_bound_at: Instant::now(),
                         last_hit_at: Instant::now(),
                         hit_count: 1,
-                        total_cached_tokens: cached_tokens,
+                        total_cached_tokens: cached_tokens.max(0),
                     },
                 );
             }
         }
+    }
+
+    /// 该账号是否有任何未过期的 session binding。
+    /// 用于 `should_preemptive_switch` —— 当前号正承载活跃会话时不抢切，保住 cache。
+    pub fn has_active_binding_to(&self, account_id: &str) -> bool {
+        let g = match self.bindings.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        g.values()
+            .any(|e| e.account_id == account_id && e.last_hit_at.elapsed() <= BINDING_TTL)
     }
 
     /// 账号被标 banned / quota 0 时，作废所有指向它的 binding，让下次同 session 重新选号。

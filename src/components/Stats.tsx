@@ -39,6 +39,55 @@ interface TokenStats {
     total_requests: number;
 }
 
+interface PlanCapacityEstimate {
+    plan_type: string;
+    window_type: '5h' | 'week';
+    sample_count: number;
+    avg_capacity: number;
+    median_capacity: number;
+    min_capacity: number;
+    max_capacity: number;
+}
+
+interface SessionInCycle {
+    session_key: string;
+    total_tokens: number;
+    turn_count: number;
+    first_seen_at: number;
+    last_seen_at: number;
+}
+
+interface CycleDetail {
+    window_start: number;
+    window_end: number;
+    is_current: boolean;
+    total_tokens: number;
+    input_tokens: number;
+    cached_input_tokens: number;
+    output_tokens: number;
+    turn_count: number;
+    sessions: SessionInCycle[];
+    estimated_capacity: number | null;
+    estimate_used_pct: number | null;
+    hit_limit: boolean;
+    last_switch_reason: string | null;
+}
+
+interface AccountTokenHistory {
+    account_id: string;
+    email: string;
+    plan_type: string;
+    is_current: boolean;
+    is_banned: boolean;
+    is_token_invalid: boolean;
+    current_5h: CycleDetail | null;
+    last_5h: CycleDetail | null;
+    current_week: CycleDetail | null;
+    last_week: CycleDetail | null;
+    cycles_5h: CycleDetail[];
+    cycles_week: CycleDetail[];
+}
+
 const COLORS = ['#8b5cf6', '#10b981', '#f59e0b', '#ef4444', '#3b82f6', '#ec4899', '#14b8a6', '#f97316'];
 
 function formatTokens(n: number): string {
@@ -69,21 +118,29 @@ export function Stats() {
     const [switchHistory, setSwitchHistory] = useState<SwitchEvent[]>([]);
     const [switchStats, setSwitchStats] = useState<SwitchStats | null>(null);
     const [tokenStats, setTokenStats] = useState<TokenStats | null>(null);
+    const [planCaps, setPlanCaps] = useState<PlanCapacityEstimate[]>([]);
+    const [accountHistory, setAccountHistory] = useState<AccountTokenHistory[]>([]);
+    const [expandedAccount, setExpandedAccount] = useState<string | null>(null);
+    const [expandedCycle, setExpandedCycle] = useState<string | null>(null);
 
     const days = range === 'day' ? 1 : range === 'week' ? 7 : 30;
 
     const fetchData = async () => {
         try {
-            const [th, sh, ss, ts] = await Promise.all([
+            const [th, sh, ss, ts, pc, ah] = await Promise.all([
                 invoke<TokenHistoryEntry[]>('get_token_history', { days }),
                 invoke<SwitchEvent[]>('get_switch_history', { days }),
                 invoke<SwitchStats>('get_switch_stats'),
                 invoke<TokenStats>('get_token_stats'),
+                invoke<PlanCapacityEstimate[]>('get_plan_capacity_estimates'),
+                invoke<AccountTokenHistory[]>('get_account_token_history'),
             ]);
             setTokenHistory(th);
             setSwitchHistory(sh.reverse());
             setSwitchStats(ss);
             setTokenStats(ts);
+            setPlanCaps(pc);
+            setAccountHistory(ah);
         } catch (e) {
             console.error('加载统计数据失败:', e);
         }
@@ -163,6 +220,128 @@ export function Stats() {
                     <div className="stat-card-label">使用账号数</div>
                 </div>
             </div>
+
+            {/* Plan 配额上限估算（基于 quota 快照 Δpct） */}
+            {planCaps.length > 0 && (() => {
+                const allPlans = Array.from(new Set(planCaps.map(p => p.plan_type))).sort();
+                return (
+                    <div className="stats-section">
+                        <h3>Plan 配额上限估算（Δpct 反推，不依赖账号打满）</h3>
+                        <div className="cycle-summary">
+                            <div className="cycle-summary-row cycle-summary-header capacity-header">
+                                <span>Plan</span>
+                                <span className="num">5h 样本</span>
+                                <span className="num">5h 中位</span>
+                                <span className="num">5h 平均</span>
+                                <span className="num">5h min–max</span>
+                                <span className="num">周 样本</span>
+                                <span className="num">周 中位</span>
+                                <span className="num">周 平均</span>
+                                <span className="num">周 min–max</span>
+                            </div>
+                            {allPlans.map(plan => {
+                                const f = planCaps.find(p => p.plan_type === plan && p.window_type === '5h');
+                                const w = planCaps.find(p => p.plan_type === plan && p.window_type === 'week');
+                                return (
+                                    <div key={plan} className="cycle-summary-row capacity-row">
+                                        <span>
+                                            <span className={`quota-plan plan-${plan.toLowerCase()}`}>{plan || '—'}</span>
+                                        </span>
+                                        <span className="num">{f?.sample_count ?? '—'}</span>
+                                        <span className="num total">{f ? formatTokens(f.median_capacity) : '—'}</span>
+                                        <span className="num">{f ? formatTokens(f.avg_capacity) : '—'}</span>
+                                        <span className="num observed">
+                                            {f ? `${formatTokens(f.min_capacity)}–${formatTokens(f.max_capacity)}` : '—'}
+                                        </span>
+                                        <span className="num">{w?.sample_count ?? '—'}</span>
+                                        <span className="num total">{w ? formatTokens(w.median_capacity) : '—'}</span>
+                                        <span className="num">{w ? formatTokens(w.avg_capacity) : '—'}</span>
+                                        <span className="num observed">
+                                            {w ? `${formatTokens(w.min_capacity)}–${formatTokens(w.max_capacity)}` : '—'}
+                                        </span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        <div className="cycle-hint">
+                            <b>原理</b>：每次切号前后强制抓 quota 写 `~/.codex-switcher/quota-snapshots.jsonl`。同一窗口内任意两次快照的 Δused_pct 配合期间代理 tokens → 推出该 Plan 总容量（capacity = Δtokens / Δpct × 100）。<br/>
+                            <b>中位</b>是去掉异常值后最稳的估计。Δpct&lt;3% 的样本被丢弃（used_pct 是整数，量化误差会失真）。<br/>
+                            样本会随每次切号自动累积；样本数低于 ~5 时估计仍有偏差，多用几小时即可。
+                        </div>
+                    </div>
+                );
+            })()}
+
+            {/* 每号 Token 历史（三级下钻：号 → 周期 → session） */}
+            {accountHistory.length > 0 && (
+                <div className="stats-section">
+                    <h3>每号 Token 历史（精确累加 + 估算上限）</h3>
+                    <div className="acct-hist-table">
+                        <div className="acct-hist-row acct-hist-header">
+                            <span></span>
+                            <span>邮箱 / Plan</span>
+                            <span className="num">当前 5h</span>
+                            <span className="num">上次 5h</span>
+                            <span className="num">当前 周</span>
+                            <span className="num">上次 周</span>
+                        </div>
+                        {accountHistory.map(acc => {
+                            const expanded = expandedAccount === acc.account_id;
+                            return (
+                                <div key={acc.account_id}>
+                                    <div
+                                        className={`acct-hist-row clickable ${acc.is_current ? 'current' : ''}`}
+                                        onClick={() => {
+                                            setExpandedAccount(expanded ? null : acc.account_id);
+                                            setExpandedCycle(null);
+                                        }}
+                                    >
+                                        <span className="acct-toggle">{expanded ? '▼' : '▶'}</span>
+                                        <span className="acct-email" title={acc.email}>
+                                            {acc.is_current && <span className="quota-badge current">当前</span>}
+                                            {acc.is_banned && <span className="quota-badge banned">封</span>}
+                                            {acc.is_token_invalid && <span className="quota-badge invalid">失效</span>}
+                                            <span className={`quota-plan plan-${(acc.plan_type || 'unknown').toLowerCase()}`}>{acc.plan_type || '—'}</span>
+                                            <span className="acct-email-text">{acc.email}</span>
+                                        </span>
+                                        <CellPair cycle={acc.current_5h} />
+                                        <CellPair cycle={acc.last_5h} />
+                                        <CellPair cycle={acc.current_week} />
+                                        <CellPair cycle={acc.last_week} />
+                                    </div>
+                                    {expanded && (
+                                        <div className="acct-hist-expand">
+                                            <div className="acct-cycle-header">5h 周期（{acc.cycles_5h.length}）</div>
+                                            <CycleHistoryTable
+                                                cycles={acc.cycles_5h}
+                                                accountId={acc.account_id}
+                                                windowLabel="5h"
+                                                expandedCycle={expandedCycle}
+                                                setExpandedCycle={setExpandedCycle}
+                                            />
+                                            <div className="acct-cycle-header">周周期（{acc.cycles_week.length}）</div>
+                                            <CycleHistoryTable
+                                                cycles={acc.cycles_week}
+                                                accountId={acc.account_id}
+                                                windowLabel="week"
+                                                expandedCycle={expandedCycle}
+                                                setExpandedCycle={setExpandedCycle}
+                                            />
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                    <div className="cycle-hint">
+                        每格显示「<b>实测累加 / 估算上限</b>」。<br/>
+                        <b>实测累加</b> = token-history.jsonl 在该窗口内的精确求和（不平均、不打折，无论中间切号几次）。<br/>
+                        <b>估算上限</b> = `实测累加 ÷ snapshot used_pct × 100`，用快照里 used_pct 最大那个算（量化误差最小）。`?%` 标记的 used_pct 偏小，估算误差大。<br/>
+                        🔴 = 窗口内触发过限额切号 —— 此时实测累加 ≈ Plan 实际窗口配额。<br/>
+                        点开账号看历史周期，点开周期看 session 明细。
+                    </div>
+                </div>
+            )}
 
             {/* Token 趋势图 */}
             {trendData.length > 0 && (
@@ -301,6 +480,138 @@ export function Stats() {
 function shortName(name: string): string {
     if (name.length > 18) return name.slice(0, 15) + '...';
     return name;
+}
+
+function formatWindow(startSec: number, endSec: number): string {
+    const s = new Date(startSec * 1000);
+    const e = new Date(endSec * 1000);
+    const fmtDate = (d: Date) => `${d.getMonth() + 1}/${d.getDate()}`;
+    const fmtTime = (d: Date) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    if (fmtDate(s) === fmtDate(e)) {
+        return `${fmtDate(s)} ${fmtTime(s)}-${fmtTime(e)}`;
+    }
+    return `${fmtDate(s)} ${fmtTime(s)} → ${fmtDate(e)} ${fmtTime(e)}`;
+}
+
+/// 顶层一格：「实测累加 / 估算上限」
+/// null 也用 cell-pair 双行结构，保证上下与有数据的格子严格对齐。
+function CellPair({ cycle }: { cycle: CycleDetail | null }) {
+    if (!cycle) {
+        return (
+            <span className="num cell-pair cell-empty">
+                <span className="cell-actual">—</span>
+                <span className="cell-est">&nbsp;</span>
+            </span>
+        );
+    }
+    const cap = cycle.estimated_capacity;
+    const pct = cycle.estimate_used_pct;
+    const lowConfidence = pct != null && pct < 10;
+    const isFallback = !cycle.is_current;
+    return (
+        <span className={`num cell-pair ${isFallback ? 'cell-fallback' : ''}`}>
+            <span className="cell-actual">
+                {cycle.hit_limit && <span className="cell-fire">🔴</span>}
+                {formatTokens(cycle.total_tokens)}
+            </span>
+            <span className="cell-est" title={pct != null ? `quota snapshot used_pct=${pct}% · 窗口 ${formatWindow(cycle.window_start, cycle.window_end)}` : `窗口 ${formatWindow(cycle.window_start, cycle.window_end)}`}>
+                {isFallback && <span className="cell-fallback-tag">最近</span>}
+                {cap != null
+                    ? `~${formatTokens(cap)}${lowConfidence ? '?' : ''}`
+                    : (isFallback ? <>&nbsp;</> : ' ')}
+            </span>
+        </span>
+    );
+}
+
+/// 周期列表（5h 或周）。点开一行看 session 明细。
+function CycleHistoryTable({
+    cycles,
+    accountId,
+    windowLabel,
+    expandedCycle,
+    setExpandedCycle,
+}: {
+    cycles: CycleDetail[];
+    accountId: string;
+    windowLabel: '5h' | 'week';
+    expandedCycle: string | null;
+    setExpandedCycle: (k: string | null) => void;
+}) {
+    if (cycles.length === 0) {
+        return <div className="acct-empty">无数据</div>;
+    }
+    return (
+        <div className="hist-cycle-table">
+            <div className="hist-cycle-row hist-cycle-header">
+                <span></span>
+                <span>窗口</span>
+                <span className="num">实测累加</span>
+                <span className="num">估算上限</span>
+                <span className="num">used_pct</span>
+                <span className="num">轮数</span>
+                <span className="num">session 数</span>
+                <span>状态</span>
+            </div>
+            {cycles.map(c => {
+                const key = `${accountId}-${windowLabel}-${c.window_end}`;
+                const expanded = expandedCycle === key;
+                const rowCls = c.is_current
+                    ? 'current'
+                    : c.hit_limit
+                        ? 'limit-hit'
+                        : '';
+                const statusLabel = c.is_current
+                    ? '进行中'
+                    : c.hit_limit
+                        ? `🔴 ${c.last_switch_reason ?? '限额'}`
+                        : '正常';
+                return (
+                    <div key={key}>
+                        <div
+                            className={`hist-cycle-row clickable ${rowCls}`}
+                            onClick={() => setExpandedCycle(expanded ? null : key)}
+                        >
+                            <span className="acct-toggle">{expanded ? '▼' : '▶'}</span>
+                            <span className="cycle-window">{formatWindow(c.window_start, c.window_end)}</span>
+                            <span className="num total">{c.total_tokens.toLocaleString()}</span>
+                            <span className="num">
+                                {c.estimated_capacity != null ? `~${formatTokens(c.estimated_capacity)}` : '—'}
+                            </span>
+                            <span className="num">
+                                {c.estimate_used_pct != null ? `${c.estimate_used_pct}%` : '—'}
+                            </span>
+                            <span className="num">{c.turn_count}</span>
+                            <span className="num">{c.sessions.length}</span>
+                            <span className={c.is_current ? 'cycle-status current' : c.hit_limit ? 'cycle-status limit' : 'cycle-status done'}>
+                                {statusLabel}
+                            </span>
+                        </div>
+                        {expanded && (
+                            <div className="hist-session-table">
+                                <div className="hist-session-row hist-session-header">
+                                    <span>Session</span>
+                                    <span className="num">轮数</span>
+                                    <span className="num">Token</span>
+                                    <span>首次 → 末次</span>
+                                </div>
+                                {c.sessions.map((s, idx) => (
+                                    <div key={idx} className="hist-session-row">
+                                        <span className="cycle-window" title={s.session_key}>{s.session_key.length > 40 ? s.session_key.slice(0, 40) + '…' : s.session_key}</span>
+                                        <span className="num">{s.turn_count}</span>
+                                        <span className="num total">{s.total_tokens.toLocaleString()}</span>
+                                        <span className="cycle-window">
+                                            {formatWindow(s.first_seen_at, s.last_seen_at)}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                );
+            })}
+        </div>
+    );
 }
 
 function reasonClass(reason: string): string {

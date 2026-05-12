@@ -208,3 +208,424 @@
     padding: 24px;
     font-size: 13px;
 }
+
+/* ── 订阅类型配额对比 + 周期明细 ── */
+
+/* Plan 徽标（汇总表 + 明细表行内复用） */
+.quota-plan {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 3px;
+    text-align: center;
+    text-transform: uppercase;
+}
+.quota-plan.plan-free    { background: rgba(148, 163, 184, 0.2); color: #94a3b8; }
+.quota-plan.plan-plus    { background: rgba(59, 130, 246, 0.22);  color: #3b82f6; }
+.quota-plan.plan-pro     { background: rgba(168, 85, 247, 0.22);  color: #a855f7; }
+.quota-plan.plan-team    { background: rgba(16, 185, 129, 0.22);  color: #10b981; }
+.quota-plan.plan-unknown { background: rgba(255, 255, 255, 0.08); color: var(--text-muted); }
+
+/* 配额对比汇总表 */
+.cycle-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.cycle-summary-row {
+    display: grid;
+    grid-template-columns: 0.8fr repeat(8, 1fr);
+    gap: 8px;
+    align-items: center;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.cycle-summary-row.cycle-summary-header {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+.cycle-summary-row .num {
+    font-family: 'SF Mono', monospace;
+    text-align: right;
+    color: var(--text-color);
+}
+
+.cycle-summary-row .num.total {
+    font-weight: 700;
+    color: #fbbf24;
+}
+
+.cycle-summary-row .num.observed {
+    color: var(--text-muted);
+}
+
+.cycle-summary-row.cycle-summary-header .num {
+    line-height: 1.3;
+}
+
+.cycle-hint {
+    margin-top: 10px;
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 8px 10px;
+    background: rgba(251, 191, 36, 0.06);
+    border-left: 2px solid rgba(251, 191, 36, 0.6);
+    border-radius: 4px;
+}
+
+/* 周期明细表 */
+.cycle-table {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 360px;
+    overflow-y: auto;
+}
+
+.cycle-row {
+    display: grid;
+    grid-template-columns: 1.7fr 1.3fr 0.5fr 0.5fr 0.9fr 0.9fr 0.7fr 0.9fr 0.6fr;
+    gap: 8px;
+    align-items: center;
+    padding: 6px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.cycle-row.cycle-header {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+.cycle-row:not(.cycle-header):hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.cycle-row.current {
+    background: rgba(139, 92, 246, 0.08);
+    border-left: 2px solid #8b5cf6;
+    padding-left: 6px;
+}
+
+.cycle-row.limit-hit {
+    background: rgba(239, 68, 68, 0.1);
+    border-left: 2px solid #ef4444;
+    padding-left: 6px;
+}
+
+.cycle-row.banned {
+    background: rgba(100, 116, 139, 0.12);
+    border-left: 2px solid #64748b;
+    padding-left: 6px;
+}
+
+.cycle-window {
+    color: var(--text-color);
+    font-family: 'SF Mono', monospace;
+    white-space: nowrap;
+}
+
+.cycle-email {
+    color: var(--text-color);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.cycle-row .num {
+    font-family: 'SF Mono', monospace;
+    text-align: right;
+    color: var(--text-color);
+}
+
+.cycle-row .num.cached {
+    color: #10b981;
+}
+
+.cycle-row .num.total {
+    font-weight: 700;
+    color: #fbbf24;
+}
+
+.cycle-status {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    text-align: center;
+}
+.cycle-status.current { background: rgba(139, 92, 246, 0.2); color: #a78bfa; }
+.cycle-status.done    { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
+.cycle-status.limit   { background: rgba(239, 68, 68, 0.2); color: #f87171; white-space: nowrap; }
+.cycle-status.banned  { background: rgba(100, 116, 139, 0.2); color: #94a3b8; white-space: nowrap; }
+
+/* ── 每号 Token 历史（三级下钻） ── */
+
+.acct-hist-table {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.acct-hist-row {
+    display: grid;
+    /* 邮箱列宽到能容纳完整邮箱（minmax 280-360px），最长 ~30 字符不会出现 ...；
+       数据列均分剩余宽度。 */
+    grid-template-columns: 24px minmax(280px, 360px) 1fr 1fr 1fr 1fr;
+    gap: 10px;
+    /* 所有 grid item 顶端对齐，让单行 "—" 和双行数字基线一致 */
+    align-items: start;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.acct-hist-row.acct-hist-header {
+    align-items: center;
+}
+
+/* 表头数字列 + 数据单元都居中对齐，列首尾视觉对齐 */
+.acct-hist-row > .num {
+    text-align: center;
+    font-family: 'SF Mono', monospace;
+    color: var(--text-color);
+}
+
+.acct-hist-row.acct-hist-header > .num {
+    color: var(--text-muted);
+    font-family: inherit;
+}
+
+.acct-hist-row.clickable {
+    cursor: pointer;
+}
+
+.acct-hist-row.clickable:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.acct-hist-row.acct-hist-header {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    cursor: default;
+}
+
+.acct-hist-row.current {
+    border-left: 2px solid #8b5cf6;
+    padding-left: 8px;
+}
+
+.acct-toggle {
+    color: var(--text-muted);
+    font-size: 10px;
+    text-align: center;
+}
+
+.acct-email {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-color);
+    min-width: 0;
+}
+
+.acct-email-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.cell-pair {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    align-items: center;
+}
+
+.cell-actual {
+    color: var(--text-color);
+    font-weight: 700;
+    font-size: 13px;
+    font-family: 'SF Mono', monospace;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.cell-fire {
+    font-size: 9px;
+}
+
+.cell-est {
+    color: var(--text-muted);
+    font-size: 10px;
+    font-family: 'SF Mono', monospace;
+}
+
+/* fallback：current 字段实际是"最近一个非当前周期"，弱化显示 */
+.cell-pair.cell-fallback .cell-actual {
+    color: var(--text-muted);
+    opacity: 0.8;
+}
+
+.cell-fallback-tag {
+    display: inline-block;
+    font-size: 8px;
+    padding: 1px 4px;
+    margin-right: 4px;
+    background: rgba(148, 163, 184, 0.15);
+    color: #94a3b8;
+    border-radius: 3px;
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+/* 空格子（无数据）用半透明，保留双行 layout 以便对齐 */
+.cell-pair.cell-empty .cell-actual {
+    color: var(--text-muted);
+    opacity: 0.5;
+}
+.cell-pair.cell-empty .cell-est {
+    /* 留一行空白占位，使空单元格高度 == 有数据单元格高度 */
+    visibility: hidden;
+}
+
+.acct-hist-expand {
+    background: rgba(255, 255, 255, 0.015);
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 4px 0 8px 24px;
+}
+
+.acct-cycle-header {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    margin: 10px 0 6px;
+}
+
+.acct-cycle-header:first-child {
+    margin-top: 0;
+}
+
+.acct-empty {
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 8px;
+    text-align: center;
+}
+
+.hist-cycle-table {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.hist-cycle-row {
+    display: grid;
+    grid-template-columns: 20px 1.4fr 0.9fr 0.9fr 0.6fr 0.5fr 0.7fr 0.8fr;
+    gap: 8px;
+    align-items: center;
+    padding: 5px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.hist-cycle-row.clickable {
+    cursor: pointer;
+}
+
+.hist-cycle-row.clickable:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.hist-cycle-row.hist-cycle-header {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    cursor: default;
+}
+
+.hist-cycle-row.current {
+    border-left: 2px solid #8b5cf6;
+    padding-left: 6px;
+}
+
+.hist-cycle-row.limit-hit {
+    background: rgba(239, 68, 68, 0.08);
+    border-left: 2px solid #ef4444;
+    padding-left: 6px;
+}
+
+.hist-cycle-row .num {
+    font-family: 'SF Mono', monospace;
+    text-align: right;
+    color: var(--text-color);
+}
+
+.hist-session-table {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: rgba(255, 255, 255, 0.015);
+    padding: 6px 8px 6px 28px;
+    border-radius: 4px;
+    margin: 2px 0 6px;
+}
+
+.hist-session-row {
+    display: grid;
+    grid-template-columns: 2fr 0.5fr 0.9fr 1.6fr;
+    gap: 8px;
+    font-size: 10px;
+    padding: 3px 4px;
+}
+
+.hist-session-row.hist-session-header {
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    font-size: 9px;
+}
+
+.hist-session-row .num {
+    font-family: 'SF Mono', monospace;
+    text-align: right;
+}
+
+.hist-session-row .num.total {
+    color: #fbbf24;
+    font-weight: 700;
+}

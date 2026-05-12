@@ -73,6 +73,11 @@ pub struct TokenHistoryEntry {
     pub cost_saved_usd: f64,
     #[serde(default)]
     pub account_id: String,
+    /// SessionAffinity::extract_session_key 提取出的 session 标识
+    /// （来源：prompt_cache_key / previous_response_id / hdr / 哈希兜底）
+    /// 0.5.16+ 才记录，旧记录留空。
+    #[serde(default)]
+    pub session_key: String,
 }
 
 /// 单次请求的 usage 数据
@@ -84,6 +89,7 @@ pub struct RequestUsage {
     pub total_tokens: i64,
     pub model: String,
     pub account_id: String,
+    pub session_key: String,
 }
 
 /// 累计统计数据
@@ -205,6 +211,7 @@ impl TokenTracker {
             cost,
             cost_saved_usd: cost_saved,
             account_id: usage.account_id,
+            session_key: usage.session_key,
         };
         Self::append_history(&entry);
     }
@@ -340,6 +347,7 @@ pub fn extract_usage_from_sse(data: &[u8], request_model: &str) -> Option<Reques
                     total_tokens,
                     model,
                     account_id: String::new(),
+                    session_key: String::new(),
                 });
             }
         }

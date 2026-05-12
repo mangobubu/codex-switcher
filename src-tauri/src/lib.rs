@@ -11,6 +11,7 @@ pub mod oauth;
 mod oauth_server;
 pub mod otp_login;
 mod proxy;
+mod quota_snapshot;
 mod refresh_lock;
 pub mod relay_translate;
 mod remote_client;
@@ -1336,6 +1337,23 @@ async fn switch_account(
         .await
         {
             Ok((usage, _)) => {
+                // 写 quota 快照（先取 email 不锁 store）
+                let email_for_snap = state
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|s| {
+                        s.accounts
+                            .get(&target_id)
+                            .and_then(|a| AccountStore::extract_email(&a.auth_json))
+                    })
+                    .unwrap_or_default();
+                quota_snapshot::append_from_usage(
+                    &target_id,
+                    &email_for_snap,
+                    &usage,
+                    "switch_precheck",
+                );
                 let mut store = state.store.lock().map_err(|e| e.to_string())?;
                 if let Some(account) = store.accounts.get_mut(&target_id) {
                     account.cached_quota = Some(account::CachedQuota {
@@ -1952,6 +1970,21 @@ pub fn start_quota_refresh(
 
                 match usage::UsageFetcher::fetch_usage_direct(access_token, aid, rt, false).await {
                     Ok((usage, _)) => {
+                        let email_for_snap = if let Ok(s) = store.lock() {
+                            s.accounts
+                                .get(id)
+                                .and_then(|a| AccountStore::extract_email(&a.auth_json))
+                                .unwrap_or_else(|| name.clone())
+                        } else {
+                            name.clone()
+                        };
+                        // 写 quota 快照，让"每号 Token 历史"的估算上限有数据可用
+                        quota_snapshot::append_from_usage(
+                            id,
+                            &email_for_snap,
+                            &usage,
+                            "quota_refresh",
+                        );
                         if let Ok(mut s) = store.lock() {
                             if let Some(acc) = s.accounts.get_mut(id) {
                                 acc.cached_quota = Some(account::CachedQuota {
@@ -2636,6 +2669,677 @@ fn reset_token_stats(state: State<AppState>) -> Result<(), String> {
 #[tauri::command]
 fn get_token_history(days: u32) -> Result<Vec<token_tracker::TokenHistoryEntry>, String> {
     Ok(token_tracker::TokenTracker::get_history(days))
+}
+
+/// 订阅号每个号的 5h / 周周期"实测累加 + 估算上限"三级下钻数据。
+///
+/// 设计：
+/// 1. 顶层每个订阅号一条 AccountTokenHistory，含当前/最近完成 5h、当前/最近完成周
+///    的 CycleSummary 摘要。
+/// 2. `cycles_5h` / `cycles_week` 是完整周期序列（倒序），点开账号看历史，能直接
+///    肉眼比"上周 Plus 实际配额 / 这周 Plus 实际配额"判断 codex 是否改额度。
+/// 3. 每个周期再点开看 `sessions`：该周期内每个 session_key 消耗多少 tokens、几轮。
+///
+/// 估算上限：在窗口内找一个 quota snapshot（reset_at 匹配），
+///   capacity ≈ tokens_used_up_to_snapshot_ts / (snapshot.used_pct / 100)
+/// 选 used_pct 最大的那个 snapshot 算（量化误差最小）。
+#[derive(Debug, Clone, serde::Serialize)]
+struct SessionInCycle {
+    session_key: String,
+    total_tokens: i64,
+    turn_count: u32,
+    first_seen_at: i64,
+    last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CycleDetail {
+    window_start: i64,
+    window_end: i64,
+    is_current: bool,
+    total_tokens: i64,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    turn_count: u32,
+    sessions: Vec<SessionInCycle>,
+    /// 实测累加 ÷ snapshot used_pct × 100，用来估算 Plan 真实配额
+    estimated_capacity: Option<i64>,
+    /// 估算所用快照的 used_pct（用于在前端打"低 used_pct 量化误差大"标记）
+    estimate_used_pct: Option<i32>,
+    /// 是否在窗口内触发过限额切号
+    hit_limit: bool,
+    last_switch_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AccountTokenHistory {
+    account_id: String,
+    email: String,
+    plan_type: String,
+    is_current: bool,
+    is_banned: bool,
+    is_token_invalid: bool,
+    /// 当前进行中的 5h 周期
+    current_5h: Option<CycleDetail>,
+    /// 最近一个已完成的 5h 周期
+    last_5h: Option<CycleDetail>,
+    current_week: Option<CycleDetail>,
+    last_week: Option<CycleDetail>,
+    /// 5h 周期全量历史（已完成 + 当前），倒序
+    cycles_5h: Vec<CycleDetail>,
+    /// 周周期全量历史，倒序
+    cycles_week: Vec<CycleDetail>,
+}
+
+#[tauri::command]
+fn get_account_token_history(
+    state: State<AppState>,
+) -> Result<Vec<AccountTokenHistory>, String> {
+    let history = token_tracker::TokenTracker::get_history(30);
+    let snapshots = quota_snapshot::read_all();
+    let switches = state.switch_logger.get_history(30);
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let current_id = store.current.clone();
+
+    let five_h: i64 = 5 * 3600;
+    let week_s: i64 = 7 * 24 * 3600;
+
+    let mut out: Vec<AccountTokenHistory> = Vec::new();
+
+    for (id, acc) in store.accounts.iter() {
+        if acc.is_relay() {
+            continue;
+        }
+        let cq = match acc.cached_quota.as_ref() {
+            Some(q) => q,
+            None => continue,
+        };
+        let email = AccountStore::extract_email(&acc.auth_json)
+            .unwrap_or_else(|| acc.name.clone());
+
+        // 该号的所有 entry / snapshot / switch（按时间排）
+        let mut my_entries: Vec<&token_tracker::TokenHistoryEntry> = history
+            .iter()
+            .filter(|e| e.account_id == *id)
+            .collect();
+        my_entries.sort_by_key(|e| e.timestamp.timestamp());
+
+        let mut my_snaps: Vec<&quota_snapshot::QuotaSnapshot> = snapshots
+            .iter()
+            .filter(|s| s.account_id == *id)
+            .collect();
+        my_snaps.sort_by_key(|s| s.ts.timestamp());
+
+        let cycles_5h = build_cycles(
+            &my_entries,
+            &my_snaps,
+            &switches,
+            &acc.name,
+            cq.five_hour_reset_at,
+            five_h,
+            true, // is_5h
+        );
+        let cycles_week = build_cycles(
+            &my_entries,
+            &my_snaps,
+            &switches,
+            &acc.name,
+            cq.weekly_reset_at,
+            week_s,
+            false,
+        );
+
+        // "当前 5h" 优先取 is_current 那条；账号最近没活动时（reset_at 还没真正
+        // 进入活跃周期 / 上次使用在好几个周期前）降级到最近一个有数据的周期，免得
+        // 整列全是 "—" 看不出哪些号有过用量。前端用 is_current 字段区分真"当前"
+        // 还是"最近一次"。
+        let current_5h = cycles_5h
+            .iter()
+            .find(|c| c.is_current)
+            .cloned()
+            .or_else(|| cycles_5h.first().cloned());
+        let last_5h = {
+            let cur_end = current_5h.as_ref().map(|c| c.window_end);
+            cycles_5h
+                .iter()
+                .find(|c| Some(c.window_end) != cur_end)
+                .cloned()
+        };
+        let current_week = cycles_week
+            .iter()
+            .find(|c| c.is_current)
+            .cloned()
+            .or_else(|| cycles_week.first().cloned());
+        let last_week = {
+            let cur_end = current_week.as_ref().map(|c| c.window_end);
+            cycles_week
+                .iter()
+                .find(|c| Some(c.window_end) != cur_end)
+                .cloned()
+        };
+
+        out.push(AccountTokenHistory {
+            account_id: id.clone(),
+            email,
+            plan_type: cq.plan_type.clone(),
+            is_current: current_id.as_ref() == Some(id),
+            is_banned: acc.is_banned,
+            is_token_invalid: acc.is_token_invalid,
+            current_5h,
+            last_5h,
+            current_week,
+            last_week,
+            cycles_5h,
+            cycles_week,
+        });
+    }
+
+    // 按 plan 优先级排序：pro → plus → team → free → unknown；同 plan 内按 email
+    fn plan_rank(plan: &str) -> u8 {
+        match plan.to_lowercase().as_str() {
+            "pro" => 0,
+            "plus" => 1,
+            "team" => 2,
+            "free" => 3,
+            _ => 4,
+        }
+    }
+    out.sort_by(|a, b| {
+        plan_rank(&a.plan_type)
+            .cmp(&plan_rank(&b.plan_type))
+            .then(a.email.cmp(&b.email))
+    });
+    Ok(out)
+}
+
+/// 把一个号在 30 天里的 entries 按 `reset_at` 锚点划成多个 (5h 或 周) 周期。
+/// 返回倒序（最近一个在最前），含当前进行中的窗口 + 历史已完成窗口。
+fn build_cycles(
+    entries: &[&token_tracker::TokenHistoryEntry],
+    snaps: &[&quota_snapshot::QuotaSnapshot],
+    switches: &[switch_log::SwitchEvent],
+    account_name: &str,
+    reset_at_opt: Option<i64>,
+    window_size: i64,
+    is_5h: bool,
+) -> Vec<CycleDetail> {
+    let reset_at = match reset_at_opt {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
+    use std::collections::HashMap;
+    // key = window_end → CycleDetail accumulator
+    let mut buckets: HashMap<i64, CycleDetail> = HashMap::new();
+    // session_key → (tokens, turn_count, first_ts, last_ts) within each window
+    let mut sessions_per_window: HashMap<i64, HashMap<String, SessionInCycle>> = HashMap::new();
+
+    for e in entries {
+        let ts = e.timestamp.timestamp();
+        if ts >= reset_at {
+            continue;
+        }
+        let n = (reset_at - ts - 1) / window_size;
+        let win_end = reset_at - n * window_size;
+        let win_start = win_end - window_size;
+        let is_current = n == 0;
+
+        let cycle = buckets.entry(win_end).or_insert_with(|| CycleDetail {
+            window_start: win_start,
+            window_end: win_end,
+            is_current,
+            total_tokens: 0,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            turn_count: 0,
+            sessions: Vec::new(),
+            estimated_capacity: None,
+            estimate_used_pct: None,
+            hit_limit: false,
+            last_switch_reason: None,
+        });
+        cycle.input_tokens += e.input_tokens;
+        cycle.cached_input_tokens += e.cached_input_tokens;
+        cycle.output_tokens += e.output_tokens;
+        cycle.total_tokens += e.input_tokens + e.output_tokens;
+        cycle.turn_count += 1;
+
+        // session breakdown（旧记录 session_key 为空，统一聚到 "(legacy)" 一类）
+        let sk = if e.session_key.is_empty() {
+            "(legacy)".to_string()
+        } else {
+            e.session_key.clone()
+        };
+        let sessions_map = sessions_per_window.entry(win_end).or_default();
+        let sess = sessions_map.entry(sk.clone()).or_insert(SessionInCycle {
+            session_key: sk,
+            total_tokens: 0,
+            turn_count: 0,
+            first_seen_at: ts,
+            last_seen_at: ts,
+        });
+        sess.total_tokens += e.input_tokens + e.output_tokens;
+        sess.turn_count += 1;
+        if ts < sess.first_seen_at {
+            sess.first_seen_at = ts;
+        }
+        if ts > sess.last_seen_at {
+            sess.last_seen_at = ts;
+        }
+    }
+
+    // 为每个 cycle 用 snapshot 估算 capacity。
+    // 策略：找 reset_at 匹配该 cycle 的 snapshots，
+    // 选 used_pct 最大那个（量化误差最小），
+    // 然后用"该 snapshot 之前累计的 tokens / used_pct × 100"作为 capacity。
+    for (win_end, cycle) in buckets.iter_mut() {
+        let matching_snaps: Vec<&&quota_snapshot::QuotaSnapshot> = snaps
+            .iter()
+            .filter(|s| {
+                let rs = if is_5h {
+                    s.five_hour_reset_at
+                } else {
+                    s.weekly_reset_at
+                };
+                rs == Some(*win_end)
+            })
+            .collect();
+        // 选 used_pct 最大的 snapshot
+        let best = matching_snaps.iter().max_by_key(|s| {
+            if is_5h {
+                s.five_hour_used_pct
+            } else {
+                s.weekly_used_pct
+            }
+        });
+        if let Some(s) = best {
+            let used_pct = if is_5h {
+                s.five_hour_used_pct
+            } else {
+                s.weekly_used_pct
+            };
+            if used_pct > 0 {
+                let snap_ts = s.ts.timestamp();
+                // 累加该 cycle 内、snapshot 之前的 tokens
+                let mut tokens_up_to_snap: i64 = 0;
+                for e in entries {
+                    let ts = e.timestamp.timestamp();
+                    if ts >= cycle.window_start && ts < cycle.window_end && ts <= snap_ts {
+                        tokens_up_to_snap += e.input_tokens + e.output_tokens;
+                    }
+                }
+                if tokens_up_to_snap > 0 {
+                    let cap =
+                        (tokens_up_to_snap as f64 / used_pct as f64 * 100.0).round() as i64;
+                    cycle.estimated_capacity = Some(cap);
+                    cycle.estimate_used_pct = Some(used_pct);
+                }
+            }
+        }
+    }
+
+    // 用 switch_log 反查 limit_hit（沿用旧逻辑）
+    for (win_end, cycle) in buckets.iter_mut() {
+        let win_start = cycle.window_start;
+        let win_end_slop = *win_end + 60;
+        for sw in switches.iter() {
+            let sw_ts = sw.timestamp.timestamp();
+            if sw_ts < win_start || sw_ts >= win_end_slop {
+                continue;
+            }
+            let from = match sw.from_account.as_deref() {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
+            if from != account_name {
+                continue;
+            }
+            let is_limit = matches!(
+                sw.reason,
+                switch_log::SwitchReason::Http429
+                    | switch_log::SwitchReason::InStreamRateLimit
+                    | switch_log::SwitchReason::WebSocketRateLimit
+                    | switch_log::SwitchReason::WebSocketPrecheck
+            );
+            if is_limit {
+                cycle.hit_limit = true;
+                cycle.last_switch_reason = Some(format!("{}", sw.reason));
+            }
+        }
+    }
+
+    // 把 sessions 装回 cycle，按 total_tokens 降序
+    for (win_end, mut sessions_map) in sessions_per_window {
+        if let Some(cycle) = buckets.get_mut(&win_end) {
+            let mut list: Vec<SessionInCycle> = sessions_map.drain().map(|(_, v)| v).collect();
+            list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+            cycle.sessions = list;
+        }
+    }
+
+    let mut result: Vec<CycleDetail> = buckets.into_values().collect();
+    result.sort_by(|a, b| b.window_end.cmp(&a.window_end));
+    let label = if is_5h { "5h" } else { "wk" };
+    let has_current = result.iter().any(|c| c.is_current);
+    println!(
+        "[AcctHist] {} {} entries={} reset_at={:?} cycles={} has_current={}",
+        account_name,
+        label,
+        entries.len(),
+        reset_at_opt,
+        result.len(),
+        has_current
+    );
+    result
+}
+
+/// 订阅号每个完整 5h / 周窗口的 token 总量。
+///
+/// 用途：用户横向对比 free / plus / pro / team 的实际限额 —— 当某账号在某个
+/// 窗口跑到 usage_limit_reached 时，该窗口的 total_tokens 就是该 Plan 的窗口配额。
+///
+/// 窗口对齐：以 `cached_quota.{five_hour,weekly}_reset_at` 为锚点，往前每 5h
+/// （或 1 周）划一个窗口，把 30 天历史里属于该账号的请求按时间归到对应窗口。
+/// `is_current` 标识当前进行中的窗口（n=0），其他都是已完成的历史窗口。
+#[derive(Debug, Clone, serde::Serialize)]
+struct QuotaCycle {
+    account_id: String,
+    /// account.name —— 与 switch_log.from_account 字段匹配用
+    name: String,
+    email: String,
+    plan_type: String,
+    /// "5h" 或 "week"
+    window_type: String,
+    /// 窗口起点（unix sec）
+    window_start: i64,
+    /// 窗口终点（unix sec）= 该窗口对应的 reset 时间
+    window_end: i64,
+    /// 当前进行中的窗口（n=0），其他是已完成的
+    is_current: bool,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    /// input + output（cached 已计入 input，不重复加）
+    total_tokens: i64,
+    request_count: u32,
+    /// 窗口内发生过限额触发切号（429 / WS 限额 / 流内限额 / WS 预检发现耗尽）
+    /// → 该窗口 total_tokens ≈ 该 Plan 实测窗口上限
+    limit_hit: bool,
+    /// 窗口内发生过封号触发切号 —— total_tokens 不能当限额参考
+    banned_in_window: bool,
+    /// 窗口内最后一次"限额 / 封号"切号的 reason 文本
+    last_switch_reason: Option<String>,
+    /// 该切号事件的 unix sec 时间戳
+    last_switch_at: Option<i64>,
+}
+
+#[tauri::command]
+fn get_quota_cycles(state: State<AppState>) -> Result<Vec<QuotaCycle>, String> {
+    let history = token_tracker::TokenTracker::get_history(30);
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+
+    let five_h: i64 = 5 * 3600;
+    let week: i64 = 7 * 24 * 3600;
+
+    use std::collections::HashMap;
+    // key = (account_id, window_type, window_end_unix_sec)
+    let mut buckets: HashMap<(String, String, i64), QuotaCycle> = HashMap::new();
+
+    for entry in history.iter() {
+        let acc = match store.accounts.get(&entry.account_id) {
+            Some(a) => a,
+            None => continue, // 已删除账号的旧记录
+        };
+        if acc.is_relay() {
+            continue;
+        }
+        let cq = match acc.cached_quota.as_ref() {
+            Some(q) => q,
+            None => continue, // 没拉过 quota 没法对齐窗口锚点
+        };
+
+        let email = AccountStore::extract_email(&acc.auth_json)
+            .unwrap_or_else(|| acc.name.clone());
+        let ts = entry.timestamp.timestamp();
+
+        for (kind, window_size, reset_at_opt) in [
+            ("5h", five_h, cq.five_hour_reset_at),
+            ("week", week, cq.weekly_reset_at),
+        ] {
+            let reset_at = match reset_at_opt {
+                Some(r) => r,
+                None => continue,
+            };
+            if ts >= reset_at {
+                // entry 在 cached reset_at 之后 → quota 已过期、cache 没刷
+                // 简化处理：跳过这条记录的此窗口归类
+                continue;
+            }
+            // 半开区间 [reset_at - (n+1)W, reset_at - nW)：
+            // ts = reset_at - 1     → n = 0（当前窗口）
+            // ts = reset_at - W     → n = 0（属于当前窗口的起点）
+            // ts = reset_at - W - 1 → n = 1（上一个窗口的末尾）
+            let n = (reset_at - ts - 1) / window_size;
+            let win_end = reset_at - n * window_size;
+            let win_start = win_end - window_size;
+            let is_current = n == 0;
+
+            let key = (entry.account_id.clone(), kind.to_string(), win_end);
+            let cycle = buckets.entry(key).or_insert_with(|| QuotaCycle {
+                account_id: entry.account_id.clone(),
+                name: acc.name.clone(),
+                email: email.clone(),
+                plan_type: cq.plan_type.clone(),
+                window_type: kind.to_string(),
+                window_start: win_start,
+                window_end: win_end,
+                is_current,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                request_count: 0,
+                limit_hit: false,
+                banned_in_window: false,
+                last_switch_reason: None,
+                last_switch_at: None,
+            });
+            cycle.input_tokens += entry.input_tokens;
+            cycle.cached_input_tokens += entry.cached_input_tokens;
+            cycle.output_tokens += entry.output_tokens;
+            cycle.total_tokens += entry.input_tokens + entry.output_tokens;
+            cycle.request_count += 1;
+        }
+    }
+
+    // 用 switch_log 反查每个窗口内的切号事件，标记是否真正触发了限额或封号。
+    // 限额命中（→ total_tokens ≈ 该号该窗口实测上限）：
+    //   - Http429 / InStreamRateLimit / WebSocketRateLimit：流内/握手时上游真发了限额响应
+    //   - WebSocketPrecheck：发起 WS 前发现 cached_quota.left <= 0，说明此号在该窗口
+    //     已经达到上限（虽然这次切号事件本身是"事后"，但能反推窗口被打满了）
+    // QuotaThreshold（阈值预防）不算 limit_hit，那是 cached_left 跌到阈值的提前切，
+    // total_tokens 会低于真实上限。
+    let switches = state.switch_logger.get_history(30);
+    for cycle in buckets.values_mut() {
+        let win_start = cycle.window_start;
+        // 限额响应通常在窗口最后一条 entry 之后立刻发，给 60s slop 容纳网络抖动
+        let win_end_slop = cycle.window_end + 60;
+        for sw in switches.iter() {
+            let sw_ts = sw.timestamp.timestamp();
+            if sw_ts < win_start || sw_ts >= win_end_slop {
+                continue;
+            }
+            let from = match sw.from_account.as_deref() {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
+            if from != cycle.name {
+                continue;
+            }
+            let is_limit = matches!(
+                sw.reason,
+                switch_log::SwitchReason::Http429
+                    | switch_log::SwitchReason::InStreamRateLimit
+                    | switch_log::SwitchReason::WebSocketRateLimit
+                    | switch_log::SwitchReason::WebSocketPrecheck
+            );
+            let is_ban = matches!(
+                sw.reason,
+                switch_log::SwitchReason::InStreamBanned
+                    | switch_log::SwitchReason::BannedDetected
+            );
+            if is_limit {
+                cycle.limit_hit = true;
+            }
+            if is_ban {
+                cycle.banned_in_window = true;
+            }
+            if is_limit || is_ban {
+                if cycle.last_switch_at.map(|t| t < sw_ts).unwrap_or(true) {
+                    cycle.last_switch_at = Some(sw_ts);
+                    cycle.last_switch_reason = Some(format!("{}", sw.reason));
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<QuotaCycle> = buckets.into_values().collect();
+    // plan ASC, window_type ('5h' < 'week'), window_end DESC, email ASC
+    result.sort_by(|a, b| {
+        a.plan_type
+            .cmp(&b.plan_type)
+            .then(a.window_type.cmp(&b.window_type))
+            .then(b.window_end.cmp(&a.window_end))
+            .then(a.email.cmp(&b.email))
+    });
+    Ok(result)
+}
+
+/// Plan 配额上限估算 —— 用相邻两次 quota 快照之间的 Δused_pct + 期间代理捕获到的
+/// Δtokens 反推该 Plan 的窗口配额，**不需要账号被打到 usage_limit_reached**。
+///
+/// 公式：capacity ≈ Δtokens / Δused_pct × 100
+///
+/// 桶按 (account_id, window_type, reset_at) 划分 —— 同 reset_at 意味着同一个窗口，
+/// used_pct 在桶内单调递增。Δpct 太小（<3%）的样本被丢弃，避免 used_pct 整数量化
+/// 误差放大估算。
+#[derive(Debug, Clone, serde::Serialize)]
+struct PlanCapacityEstimate {
+    plan_type: String,
+    /// "5h" 或 "week"
+    window_type: String,
+    sample_count: u32,
+    avg_capacity: f64,
+    median_capacity: f64,
+    min_capacity: f64,
+    max_capacity: f64,
+}
+
+#[tauri::command]
+fn get_plan_capacity_estimates() -> Result<Vec<PlanCapacityEstimate>, String> {
+    let snapshots = quota_snapshot::read_all();
+    let history = token_tracker::TokenTracker::get_history(30);
+
+    use std::collections::HashMap;
+    // key: (account_id, window_type, reset_at, plan_type) → [(ts, used_pct), ...]
+    let mut by_window: HashMap<(String, String, i64, String), Vec<(i64, i32)>> =
+        HashMap::new();
+    for s in &snapshots {
+        let ts = s.ts.timestamp();
+        if let Some(reset) = s.five_hour_reset_at {
+            by_window
+                .entry((
+                    s.account_id.clone(),
+                    "5h".to_string(),
+                    reset,
+                    s.plan_type.clone(),
+                ))
+                .or_default()
+                .push((ts, s.five_hour_used_pct));
+        }
+        if let Some(reset) = s.weekly_reset_at {
+            by_window
+                .entry((
+                    s.account_id.clone(),
+                    "week".to_string(),
+                    reset,
+                    s.plan_type.clone(),
+                ))
+                .or_default()
+                .push((ts, s.weekly_used_pct));
+        }
+    }
+
+    // 收集到 by_plan: (plan, window_type) → [estimate, ...]
+    let mut by_plan: HashMap<(String, String), Vec<f64>> = HashMap::new();
+    for ((account_id, window_type, _reset, plan_type), pairs) in &by_window {
+        let mut p = pairs.clone();
+        p.sort_by_key(|(ts, _)| *ts);
+        for i in 1..p.len() {
+            let (t1, pct1) = p[i - 1];
+            let (t2, pct2) = p[i];
+            if pct2 <= pct1 {
+                // 跨越 reset 边界（理论上 reset_at 已经分桶不会出现）或同时刻
+                continue;
+            }
+            let delta_pct = (pct2 - pct1) as f64;
+            // used_pct 是 0-100 整数；Δpct<3 时量化误差 >33%，丢弃
+            if delta_pct < 3.0 {
+                continue;
+            }
+            // Δtokens：t1 < entry.ts <= t2 的 token-history 累加
+            let delta_tokens: i64 = history
+                .iter()
+                .filter(|e| {
+                    e.account_id == *account_id
+                        && e.timestamp.timestamp() > t1
+                        && e.timestamp.timestamp() <= t2
+                })
+                .map(|e| e.input_tokens + e.output_tokens)
+                .sum();
+            if delta_tokens <= 0 {
+                continue;
+            }
+            let estimate = delta_tokens as f64 / delta_pct * 100.0;
+            by_plan
+                .entry((plan_type.clone(), window_type.clone()))
+                .or_default()
+                .push(estimate);
+        }
+    }
+
+    let mut result: Vec<PlanCapacityEstimate> = by_plan
+        .into_iter()
+        .map(|((plan, wt), mut estimates)| {
+            estimates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = estimates.len();
+            let avg = estimates.iter().sum::<f64>() / n as f64;
+            let median = if n % 2 == 1 {
+                estimates[n / 2]
+            } else {
+                (estimates[n / 2 - 1] + estimates[n / 2]) / 2.0
+            };
+            let min = *estimates.first().unwrap();
+            let max = *estimates.last().unwrap();
+            PlanCapacityEstimate {
+                plan_type: plan,
+                window_type: wt,
+                sample_count: n as u32,
+                avg_capacity: avg,
+                median_capacity: median,
+                min_capacity: min,
+                max_capacity: max,
+            }
+        })
+        .collect();
+    result.sort_by(|a, b| {
+        a.plan_type
+            .cmp(&b.plan_type)
+            .then(a.window_type.cmp(&b.window_type))
+    });
+    Ok(result)
 }
 
 /// 手动触发一次 client 模式快速 auth.json 同步（拉 Server current → 写盘）。
@@ -3950,6 +4654,9 @@ pub fn run() {
             set_codex_features_goals,
             get_codex_features_goals,
             get_token_history,
+            get_quota_cycles,
+            get_plan_capacity_estimates,
+            get_account_token_history,
             get_session_bindings,
             force_auth_resync,
             get_switch_history,

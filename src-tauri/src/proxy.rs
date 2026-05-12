@@ -700,7 +700,17 @@ fn should_preemptive_switch(state: &ProxyState) -> bool {
     let plan = quota.plan_type.to_lowercase();
     let is_free = plan == "free" || plan == "unknown";
 
+    // 阈值命中前先看：当前号是否还有活跃 session affinity binding。
+    // 有的话主动抢切会立刻让进行中的会话掉 prompt cache —— 这种"预防 429"的代价
+    // 是 cache cold-start（write 1.25× + 下一轮 input 全价）。让请求自己撞 429
+    // 再切才划算（撞 429 时 affinity 也会被 invalidate，行为一致），并且能榨出
+    // 当前号最后那一点额度。
+    let has_active_session = state.session_affinity.has_active_binding_to(current_id);
+
     if is_free && fg > 0.0 && quota.five_hour_left < fg {
+        if has_active_session {
+            return false;
+        }
         println!(
             "[Proxy] Free 保护线触发: {:.0}% < {:.0}%",
             quota.five_hour_left, fg
@@ -708,6 +718,9 @@ fn should_preemptive_switch(state: &ProxyState) -> bool {
         return true;
     }
     if t5h > 0.0 && quota.five_hour_left < t5h {
+        if has_active_session {
+            return false;
+        }
         println!(
             "[Proxy] 5h 阈值触发: {:.0}% < {:.0}%",
             quota.five_hour_left, t5h
@@ -715,6 +728,9 @@ fn should_preemptive_switch(state: &ProxyState) -> bool {
         return true;
     }
     if tw > 0.0 && quota.weekly_left < tw {
+        if has_active_session {
+            return false;
+        }
         println!("[Proxy] 周阈值触发: {:.0}% < {:.0}%", quota.weekly_left, tw);
         return true;
     }
@@ -778,6 +794,49 @@ fn mark_current_quota_depleted(state: &ProxyState) {
     }
 }
 
+/// 后台拉一次 /wham/usage 把 used_percent 写进 quota-snapshots.jsonl。
+/// info 为 None（Relay / 没拿到 access_token / 等）则跳过。
+fn spawn_quota_snapshot(
+    info: Option<(String, String, Option<String>, Option<String>, String)>,
+    trigger: &'static str,
+) {
+    let (store_id, access_token, chatgpt_account_id, refresh_token, email) = match info {
+        Some(x) => x,
+        None => return,
+    };
+    tauri::async_runtime::spawn(async move {
+        match crate::usage::UsageFetcher::fetch_usage_direct(
+            access_token,
+            chatgpt_account_id,
+            refresh_token,
+            false,
+        )
+        .await
+        {
+            Ok((usage, _)) => {
+                let snap = crate::quota_snapshot::QuotaSnapshot {
+                    ts: chrono::Utc::now(),
+                    account_id: store_id,
+                    email,
+                    plan_type: usage.plan_type,
+                    five_hour_used_pct: usage.five_hour_used,
+                    weekly_used_pct: usage.weekly_used,
+                    five_hour_reset_at: usage.five_hour_reset_at,
+                    weekly_reset_at: usage.weekly_reset_at,
+                    trigger: trigger.to_string(),
+                };
+                crate::quota_snapshot::append(&snap);
+            }
+            Err(e) => {
+                println!(
+                    "[QuotaSnap] {} 抓取失败（trigger={}）: {}",
+                    store_id, trigger, e
+                );
+            }
+        }
+    });
+}
+
 fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(), String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
 
@@ -793,6 +852,35 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
         .and_then(|id| store.accounts.get(id))
         .and_then(|a| a.cached_quota.as_ref())
         .map(|q| q.five_hour_left);
+
+    // 抓 quota 快照需要的字段（必须在 switch_to 改 store.current 之前取，
+    // 否则就拿不到 from 号了）。Relay 号跳过，因为 /wham/usage 不接受其 token。
+    let from_fetch_info = store.current.as_ref().and_then(|id| {
+        let acc = store.accounts.get(id)?;
+        if acc.is_relay() {
+            return None;
+        }
+        let at = crate::account::AccountStore::extract_access_token(&acc.auth_json)?;
+        let aid = crate::account::AccountStore::extract_account_id(&acc.auth_json);
+        let rt = acc.refresh_token.clone();
+        let email = crate::account::AccountStore::extract_email(&acc.auth_json)
+            .unwrap_or_else(|| acc.name.clone());
+        Some((id.clone(), at, aid, rt, email))
+    });
+    let to_fetch_info = {
+        let acc = store.accounts.get(new_id);
+        match acc {
+            Some(a) if !a.is_relay() => {
+                let at = crate::account::AccountStore::extract_access_token(&a.auth_json);
+                let aid = crate::account::AccountStore::extract_account_id(&a.auth_json);
+                let rt = a.refresh_token.clone();
+                let email = crate::account::AccountStore::extract_email(&a.auth_json)
+                    .unwrap_or_else(|| a.name.clone());
+                at.map(|at| (new_id.to_string(), at, aid, rt, email))
+            }
+            _ => None,
+        }
+    };
 
     // 代理内部切号：按 switch_mode 决定 hot/cold。proxy 在跑时 hot 完全够 ——
     // 因为 codex（CLI / App 内置二进制）走 OPENAI_BASE_URL=proxy，每次请求 proxy
@@ -827,7 +915,12 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
     );
 
     state.stats.auto_switches.fetch_add(1, Ordering::Relaxed);
-    state.ws_disconnect.notify_waiters();
+    // 注意：do_switch 这里**不再**广播 ws_disconnect。
+    // 理由：notify_waiters 会把所有并发 WS bridge 一口气全炸断（不区分账号），
+    // 但实际"该断的"那条 bridge 自己在 detect_ws_rate_limit/banned 里就 send 了
+    // Close 帧；其他 bridge 用的是别的号、跟本次切号无关，被殃及只会让 codex
+    // 看到 "websocket closed by server before response.completed" + Reconnecting。
+    // 手动切号（lib.rs::switch_account）依然 notify，那是用户期望立即生效。
     let _ = state.app_handle.emit("proxy-account-switched", &to_name);
     let _ = state.app_handle.emit("accounts-updated", ());
 
@@ -849,6 +942,11 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
     };
 
     drop(store); // 释放锁
+
+    // Quota 快照：切走前的 from + 切到后的 to，两个时间点的 used_percent 让
+    // get_plan_capacity_estimates 能反推 Plan 配额（详见 quota_snapshot.rs）。
+    spawn_quota_snapshot(from_fetch_info, "switch_out");
+    spawn_quota_snapshot(to_fetch_info, "switch_in");
 
     if let Some((primary, fallback, secret, nid)) = solo_push {
         tauri::async_runtime::spawn(async move {
@@ -1218,6 +1316,55 @@ async fn handle_request(
     //   - body 含 usage_limit_reached / insufficient_quota / usage_not_included
     //     → per-account 配额耗尽，切号
     //   - 其他 429（无明确 code） → 默认切号
+    //
+    // `/responses/compact` 特殊处理：
+    // 验证 codex 源码（codex-rs/codex-api/src/common.rs CompactionInput）后确认，
+    // compact 请求体 **不带 response_id**，body 是 `input: Vec<ResponseItem>`（完整
+    // 对话历史）+ 标准参数；headers 也明确传 `turn_state=None`。所以切到新号重试在
+    // 协议层是合法的 —— 之前 0.5.14 关闭切号是基于"response_id 绑死账号"的错误假设。
+    //
+    // 这里改成：先乐观切号重试。
+    //   - 重试拿到 2xx → 真无损切号，codex 不感知错误
+    //   - 重试拿到 4xx（仍有别的服务端绑定如 session_id / 信任度问题）→ **不把 4xx 透回**
+    //     codex（4xx 是 terminal，整条对话就死了），改成把原始 429 透回（transient，codex
+    //     只是放弃这次 compact，session 继续工作）
+    let is_compact_path = path_and_query.contains("/responses/compact");
+    if status_code == reqwest::StatusCode::TOO_MANY_REQUESTS && is_compact_path {
+        let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
+        println!("[Proxy] compact 路径 429，尝试切号重试...");
+        mark_current_quota_depleted(&state);
+        if let Some(retry_resp) = dispatch_quota_switch_retry(
+            &state,
+            &method,
+            &upstream_url,
+            &base_headers,
+            &body_bytes,
+            session_key.as_deref(),
+            SwitchReason::Http429,
+        )
+        .await
+        {
+            let retry_status = retry_resp.status();
+            if retry_status.is_success() {
+                println!("[Proxy] compact 切号重试成功（{}），无损切号", retry_status);
+                return Ok(retry_resp);
+            }
+            // 新号也返 4xx —— 通常是某种服务端绑定（session_id/thread_id 等）
+            // 不能把 4xx 透回 codex，伪装成原始 429（transient）让 codex 放弃这次
+            // compact 但保留 session。
+            println!(
+                "[Proxy] compact 切号后新号返 {}，伪装成 429 透回避免 codex 终端崩",
+                retry_status
+            );
+        } else {
+            println!("[Proxy] compact 切号无果，把原始 429 透回");
+        }
+        return Ok(Response::builder()
+            .status(429)
+            .header("content-type", "application/json")
+            .body(full_body(resp_bytes))
+            .unwrap_or_else(|_| error_response(StatusCode::TOO_MANY_REQUESTS, "429")));
+    }
     if status_code == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
         let body_lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
@@ -1665,7 +1812,8 @@ async fn adopt_remote_current(
         store.current = Some(new_id.to_string());
         let _ = store.save();
     }
-    state.ws_disconnect.notify_waiters();
+    // 同 do_switch 的理由：client 模式被 Server 推过来的切号也不该牵连无关 bridge。
+    // 真正"该断的"那条 bridge 在 limit 检测里自己会送 Close。
     let _ = state.app_handle.emit("accounts-updated", ());
     Ok(())
 }
@@ -2274,7 +2422,7 @@ async fn dispatch_quota_switch_retry(
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let result = try_remote_switch_and_retry(
+            let remote_result = try_remote_switch_and_retry(
                 state,
                 method,
                 upstream_url,
@@ -2284,8 +2432,27 @@ async fn dispatch_quota_switch_retry(
                 remote_label,
             )
             .await;
+            if remote_result.is_some() {
+                state.switching.store(false, Ordering::SeqCst);
+                return remote_result;
+            }
+            // 远端切号失败（Server 不可达 / Server 报"全部耗尽" / token 失效等）。
+            // 已经有"原请求 Server 不可达时 fall through 本地直发"的逻辑，限额后的切号
+            // 重试也应该走同样的本地兜底，否则用户就会看到原始 429 body（"hit your usage
+            // limit"）而代理静默不切。
+            println!("[Proxy] client 远端切号无果，降级本地 try_switch_and_retry 兜底");
+            let local_result = try_switch_and_retry(
+                state,
+                method,
+                upstream_url,
+                base_headers,
+                body,
+                session_key,
+                reason,
+            )
+            .await;
             state.switching.store(false, Ordering::SeqCst);
-            return result;
+            return local_result;
         }
         // 别人正在切号 → 短等后用最新 current 直接重发
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3073,17 +3240,22 @@ fn build_stream_response_from_parts(
                         usage.model,
                         if account_id_for_record.is_empty() { "?" } else { &account_id_for_record }
                     );
-                    // Evidence-based affinity：只在 cached_tokens > 0 时把 session 黏到当前号
+                    // 每个 response.completed 都记 affinity binding，不要求 cache 命中
+                    // —— 首轮必然 cold cache，要等到第二轮才看见命中，期间 session 可能
+                    // 已经被切走了。详见 session_affinity::record_cache_hit 注释。
                     if let Some(ctx) = &affinity_clone {
-                        if usage.cached_input_tokens > 0 {
-                            ctx.affinity.record_cache_hit(
-                                &ctx.session_key,
-                                &ctx.account_id,
-                                usage.cached_input_tokens,
-                            );
-                        }
+                        ctx.affinity.record_cache_hit(
+                            &ctx.session_key,
+                            &ctx.account_id,
+                            usage.cached_input_tokens,
+                        );
                     }
+                    let session_key_for_record = affinity_clone
+                        .as_ref()
+                        .map(|c| c.session_key.clone())
+                        .unwrap_or_default();
                     usage.account_id = account_id_for_record;
+                    usage.session_key = session_key_for_record;
                     if let Some(tracker) = tracker_clone {
                         tracker.record(usage);
                     }
@@ -3201,6 +3373,25 @@ async fn handle_websocket(
                             .await
                             {
                                 Ok((usage, _)) => {
+                                    // 写 quota 快照
+                                    let email_snap = state
+                                        .store
+                                        .lock()
+                                        .ok()
+                                        .and_then(|s| {
+                                            s.accounts.get(&id).and_then(|a| {
+                                                crate::account::AccountStore::extract_email(
+                                                    &a.auth_json,
+                                                )
+                                            })
+                                        })
+                                        .unwrap_or_default();
+                                    crate::quota_snapshot::append_from_usage(
+                                        &id,
+                                        &email_snap,
+                                        &usage,
+                                        "ws_precheck",
+                                    );
                                     // 更新缓存
                                     if let Ok(mut store) = state.store.lock() {
                                         if let Some(acc) = store.accounts.get_mut(&id) {
@@ -3726,10 +3917,59 @@ fn detect_ws_rate_limit(msg: &tungstenite::Message) -> bool {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
             let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            // response.failed / error 类型直接判定
+            // response.failed / error 类型：必须看内层 error.code / error.type，
+            // 不能假设所有 response.failed 都是限额。上游因 model_error /
+            // content_policy / invalid_request_error / 等非限额原因也会发
+            // response.failed，盲目切号会浪费账号 + 让 codex 看到「ws closed
+            // before response.completed」+ Reconnecting。
             if msg_type == "response.failed" || msg_type == "error" {
-                println!("[Proxy] WS 限额: type={}", msg_type);
-                return true;
+                let error_obj = val
+                    .get("response")
+                    .and_then(|r| r.get("error"))
+                    .or_else(|| val.get("error"));
+                let inner_code = error_obj
+                    .and_then(|e| e.get("code").or_else(|| e.get("type")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let inner_msg = error_obj
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                // 已知的限额 / 容量 code（is_capacity_only 后面再细分全局 vs 单号）
+                const RATE_LIMIT_CODES: &[&str] = &[
+                    "usage_limit_reached",
+                    "rate_limit_exceeded",
+                    "rate_limit_error",
+                    "insufficient_quota",
+                    "billing_hard_limit_reached",
+                    "server_is_overloaded",
+                    "model_overloaded",
+                    "slow_down",
+                ];
+
+                let code_match = RATE_LIMIT_CODES
+                    .iter()
+                    .any(|c| inner_code.eq_ignore_ascii_case(c));
+                let inner_msg_lower = inner_msg.to_lowercase();
+                let msg_match = inner_msg_lower.contains("usage limit")
+                    || inner_msg_lower.contains("rate limit")
+                    || inner_msg_lower.contains("too many requests")
+                    || inner_msg_lower.contains("hit your usage limit");
+
+                if code_match || msg_match {
+                    println!("[Proxy] WS 限额: type={} code={}", msg_type, inner_code);
+                    return true;
+                }
+
+                // 非限额错误（model_error / invalid_request / content_policy 等）
+                // → 透传给 codex 让它按错误自己处理，不要切号 + 关 WS
+                let preview: String = inner_msg.chars().take(120).collect();
+                println!(
+                    "[Proxy] WS 非限额错误（type={} code={} msg={:?}），透传不切号",
+                    msg_type, inner_code, preview
+                );
+                return false;
             }
 
             // 有 error 字段且非 null 才判定（response.created 等 in_progress 事件
@@ -3797,8 +4037,28 @@ fn detect_ws_banned(msg: &tungstenite::Message) -> bool {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
             let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+            // response.failed / error 类型：必须看内层 error.code / error.message
+            // 是否真的是封号。盲目按 type 切号会误判（同 rate_limit 的修复）。
             if msg_type == "response.failed" || msg_type == "error" {
-                return true;
+                let error_obj = val
+                    .get("response")
+                    .and_then(|r| r.get("error"))
+                    .or_else(|| val.get("error"));
+                let inner_code = error_obj
+                    .and_then(|e| e.get("code").or_else(|| e.get("type")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let inner_msg = error_obj
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                let hit = BANNED_KEYWORDS
+                    .iter()
+                    .any(|kw| inner_code.contains(kw) || inner_msg.contains(kw));
+                return hit;
             }
 
             // error 字段里包含封号关键词（同样要排除 null，避免 in_progress 误判）
@@ -3840,11 +4100,27 @@ async fn bridge_websockets<S1, S2>(
     let ws_session_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let ws_session_key_w = ws_session_key.clone();
 
+    // 诊断：每边的帧计数，用于定位"bridge 立刻退出"（Broken pipe 重连噪声）。
+    let c2u_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let u2c_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let c2u_count_b = c2u_count.clone();
+    let u2c_count_b = u2c_count.clone();
+
     let client_to_upstream = async {
         while let Some(msg) = client_read.next().await {
             match msg {
                 Ok(msg) => {
+                    let cnt = c2u_count_b
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    if cnt == 1 {
+                        println!(
+                            "[Proxy] WS bridge: 首帧 client→upstream ({})",
+                            describe_ws_msg(&msg)
+                        );
+                    }
                     if msg.is_close() {
+                        println!("[Proxy] WS bridge: client 发送 Close → 转发 upstream");
                         let _ = upstream_write.send(msg).await;
                         break;
                     }
@@ -3866,11 +4142,15 @@ async fn bridge_websockets<S1, S2>(
                             }
                         }
                     }
-                    if upstream_write.send(msg).await.is_err() {
+                    if let Err(e) = upstream_write.send(msg).await {
+                        println!("[Proxy] WS bridge: upstream_write.send 失败: {}", e);
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    println!("[Proxy] WS bridge: client_read Err: {}", e);
+                    break;
+                }
             }
         }
     };
@@ -3881,6 +4161,15 @@ async fn bridge_websockets<S1, S2>(
         while let Some(msg) = upstream_read.next().await {
             match msg {
                 Ok(msg) => {
+                    let cnt = u2c_count_b
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    if cnt == 1 {
+                        println!(
+                            "[Proxy] WS bridge: 首帧 upstream→client ({})",
+                            describe_ws_msg(&msg)
+                        );
+                    }
                     // 检测错误：**不要把错误消息转发给 client**（之前的 bug），
                     // 区分两种 case：
                     //   - per-account 限额：本号已耗尽 → 切号 + 关 WS
@@ -3956,45 +4245,90 @@ async fn bridge_websockets<S1, S2>(
                                     usage.model,
                                     if cur_id.is_empty() { "?" } else { &cur_id }
                                 );
-                                if usage.cached_input_tokens > 0 {
-                                    if let Ok(g) = ws_session_key_r.lock() {
-                                        if let Some(sk) = g.as_ref() {
-                                            if !cur_id.is_empty() {
-                                                state_clone.session_affinity.record_cache_hit(
-                                                    sk,
-                                                    &cur_id,
-                                                    usage.cached_input_tokens,
-                                                );
-                                            }
-                                        }
-                                    }
+                                // WS 路径也一样：每次 response.completed 就记 binding，
+                                // 不要求 cache 命中（详见 session_affinity::record_cache_hit）。
+                                let sk_for_record = ws_session_key_r
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.as_ref().cloned())
+                                    .unwrap_or_default();
+                                if !sk_for_record.is_empty() && !cur_id.is_empty() {
+                                    state_clone.session_affinity.record_cache_hit(
+                                        &sk_for_record,
+                                        &cur_id,
+                                        usage.cached_input_tokens,
+                                    );
                                 }
                                 usage.account_id = cur_id;
+                                usage.session_key = sk_for_record;
                                 state_clone.tracker.record(usage);
                             }
                         }
                     }
 
                     if msg.is_close() {
+                        if let tungstenite::Message::Close(ref cf) = msg {
+                            println!(
+                                "[Proxy] WS bridge: upstream 发送 Close: {:?}",
+                                cf
+                            );
+                        }
                         let _ = client_write.send(msg).await;
                         break;
                     }
 
-                    if client_write.send(msg).await.is_err() {
+                    if let Err(e) = client_write.send(msg).await {
+                        println!("[Proxy] WS bridge: client_write.send 失败: {}", e);
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    println!("[Proxy] WS bridge: upstream_read Err: {}", e);
+                    break;
+                }
             }
         }
     };
 
     tokio::select! {
-        _ = client_to_upstream => {},
-        _ = upstream_to_client => {},
-        _ = disconnect.notified() => {
-            println!("[Proxy] 账号已切换，断开 WebSocket 连接（Codex App 将自动重连）");
+        _ = client_to_upstream => {
+            println!(
+                "[Proxy] WS bridge 退出: client_to_upstream（c→u={} u→c={}）",
+                c2u_count.load(std::sync::atomic::Ordering::Relaxed),
+                u2c_count.load(std::sync::atomic::Ordering::Relaxed)
+            );
         },
+        _ = upstream_to_client => {
+            println!(
+                "[Proxy] WS bridge 退出: upstream_to_client（c→u={} u→c={}）",
+                c2u_count.load(std::sync::atomic::Ordering::Relaxed),
+                u2c_count.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        },
+        _ = disconnect.notified() => {
+            println!(
+                "[Proxy] WS bridge 退出: disconnect notified（c→u={} u→c={}）",
+                c2u_count.load(std::sync::atomic::Ordering::Relaxed),
+                u2c_count.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        },
+    }
+}
+
+/// 把 WS Message 简单描述成一行：诊断 log 不要打全文（response.created 单帧 >20KB）。
+fn describe_ws_msg(msg: &tungstenite::Message) -> String {
+    match msg {
+        tungstenite::Message::Text(t) => {
+            let bytes = t.as_bytes();
+            let preview_end = bytes.len().min(80);
+            let preview = String::from_utf8_lossy(&bytes[..preview_end]);
+            format!("Text {}B preview={:?}", bytes.len(), preview)
+        }
+        tungstenite::Message::Binary(b) => format!("Binary {}B", b.len()),
+        tungstenite::Message::Ping(b) => format!("Ping {}B", b.len()),
+        tungstenite::Message::Pong(b) => format!("Pong {}B", b.len()),
+        tungstenite::Message::Close(cf) => format!("Close {:?}", cf),
+        tungstenite::Message::Frame(_) => "Frame(raw)".to_string(),
     }
 }
 

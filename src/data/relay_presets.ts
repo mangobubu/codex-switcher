@@ -77,6 +77,19 @@ export const RELAY_PRESETS: RelayPreset[] = [
         description: 'GLM Coding Plan（codex /v1/responses ↔ /chat/completions 翻译，内置）',
     },
     {
+        id: 'freemodel',
+        name: 'FreeModel',
+        base_url: 'https://api.freemodel.dev',
+        homepage: 'https://freemodel.dev/dashboard/docs',
+        // freemodel 没公开标准 /v1/usage 接口，不拉余额
+        usage_preset: null,
+        // codex 原生 /v1/responses 协议，不需要翻译
+        relay_protocol: 'responses',
+        // 上游兼容 gpt-5 family，不需要映射；codex 默认发啥用啥
+        model_fallback: 'gpt-5.5',
+        description: 'FreeModel.dev — Codex /v1/responses 中转，apikey 认证（gpt-5.5 兼容）',
+    },
+    {
         id: 'custom',
         name: '自定义中转站',
         base_url: '',
