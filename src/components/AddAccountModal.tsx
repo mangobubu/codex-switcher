@@ -190,6 +190,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
     const [relayUsagePreset, setRelayUsagePreset] = useState<string | null>(
         RELAY_PRESETS[0]?.usage_preset ?? null,
     );
+    const [relayUsageCookie, setRelayUsageCookie] = useState<string>('');
     const [relayModelFallback, setRelayModelFallback] = useState<string>(
         RELAY_PRESETS[0]?.model_fallback ?? '',
     );
@@ -212,6 +213,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
             setRelayName(preset.name);
             setRelayBaseUrl(preset.base_url);
             setRelayUsagePreset(preset.usage_preset ?? null);
+            setRelayUsageCookie('');
             setRelayModelFallback(preset.model_fallback ?? '');
             setRelayProtocol(preset.relay_protocol ?? 'responses');
             const m = preset.model_map ?? {};
@@ -249,6 +251,10 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
             setRelayError('API Key 看起来太短');
             return;
         }
+        if (relayUsagePreset === 'mimo_token_plan' && !relayUsageCookie.trim()) {
+            setRelayError('MiMo 配额查询需要粘贴 platform.xiaomimimo.com 的 Cookie；如果暂时不查配额，请把余额查询策略改成“不拉取”。');
+            return;
+        }
         setRelaySubmitting(true);
         try {
             const preset = RELAY_PRESETS.find(p => p.id === relayPresetId);
@@ -259,6 +265,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                 apiKey: relayApiKey.trim(),
                 homepage: preset?.homepage ?? null,
                 usagePreset: relayUsagePreset ?? null,
+                usageCookie: relayUsageCookie.trim() || null,
                 notes: `from preset:${relayPresetId}`,
                 modelMap: Object.keys(modelMap).length > 0 ? modelMap : null,
                 modelFallback: relayModelFallback.trim() || null,
@@ -267,6 +274,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
             await emit('accounts-updated');
             // 重置表单
             setRelayApiKey('');
+            setRelayUsageCookie('');
             handleClose();
         } catch (e) {
             setRelayError(typeof e === 'string' ? e : String(e));
@@ -549,12 +557,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                         >
                             批量导入文件
                         </button>
-                        <button
-                            className={`tab-item ${activeTab === 'relay' ? 'active' : ''}`}
-                            onClick={() => !loading && !otpRunning && setActiveTab('relay')}
-                        >
-                            中转站
-                        </button>
+                        {/* "中转站" tab moved to dedicated AddRelayModal — see App.tsx 顶部 "+ 添加中转" 按钮 */}
                     </div>
                 </div>
 
@@ -801,8 +804,31 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                     <option value="">不拉取</option>
                                     <option value="openai_compat">openai_compat (GET /v1/usage)</option>
                                     <option value="glm_zhipu">glm_zhipu (GLM 自家 quota 接口)</option>
+                                    <option value="mimo_token_plan">mimo_token_plan (MiMo 控制台 Cookie)</option>
                                 </select>
                             </div>
+
+                            {relayUsagePreset === 'mimo_token_plan' && (
+                                <div className="form-group form-group-full">
+                                    <label htmlFor="relay-usage-cookie">
+                                        MiMo 配额 Cookie <span style={{ color: 'var(--text-muted)', fontWeight: 'normal', fontSize: 12 }}>
+                                            登录 platform.xiaomimimo.com 后，从 Network 复制 Cookie header
+                                        </span>
+                                    </label>
+                                    <textarea
+                                        id="relay-usage-cookie"
+                                        value={relayUsageCookie}
+                                        onChange={e => setRelayUsageCookie(e.target.value)}
+                                        disabled={relaySubmitting}
+                                        rows={3}
+                                        placeholder="Cookie: api-platform_serviceToken=...; userId=...; api-platform_ph=..."
+                                        style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12, width: '100%' }}
+                                    />
+                                    <p className="modal-tip" style={{ margin: '6px 0 0', fontSize: 12 }}>
+                                        这里的 Cookie 只用于查询 Token Plan 用量，不会参与模型请求。实际调用仍使用上面的 tp-key。
+                                    </p>
+                                </div>
+                            )}
 
                             <div className="form-group">
                                 <label htmlFor="relay-protocol">

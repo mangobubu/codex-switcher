@@ -127,6 +127,30 @@
     line-height: 1.4;
 }
 
+/* RELAY filter — emphasised because relay accounts are first-class now */
+.filter-btn--relay {
+    color: #c4b5fd;
+    background: rgba(139, 92, 246, 0.12);
+    padding: 5px 10px;
+}
+.filter-btn--relay:hover {
+    color: #c4b5fd;
+    background: rgba(139, 92, 246, 0.20);
+}
+.filter-btn--relay.active {
+    color: #fff;
+    background: #8b5cf6;
+    box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.5);
+}
+.filter-btn--relay .filter-count {
+    background: rgba(139, 92, 246, 0.30);
+    color: #c4b5fd;
+}
+.filter-btn--relay.active .filter-count {
+    background: rgba(255, 255, 255, 0.25);
+    color: #fff;
+}
+
 /* 工具栏右侧 icon-only 按钮（替代之前的"+ 添加 / 配额 / 自动重载" 文字按钮） */
 .toolbar-icon-btn {
     width: 30px;
@@ -171,6 +195,18 @@
     background: var(--primary-color);
     color: #fff;
     filter: brightness(1.1);
+}
+
+.toolbar-icon-btn-relay {
+    background: #8b5cf6;
+    color: #fff;
+    border-color: #8b5cf6;
+}
+
+.toolbar-icon-btn-relay:hover {
+    background: #7c3aed;
+    color: #fff;
+    border-color: #7c3aed;
 }
 
 .toolbar-icon-btn-accent {
@@ -712,6 +748,18 @@
 .badge.kind-relay {
     background: rgba(168, 85, 247, 0.16);
     color: #a855f7;
+}
+
+/* Coding Plan / Token Plan 类（厂商自家订阅） */
+.badge.kind-codingplan {
+    background: rgba(245, 158, 11, 0.14);
+    color: #fbbf24;
+}
+
+/* 厂商按量付费 / 三方 API */
+.badge.kind-thirdparty {
+    background: rgba(59, 130, 246, 0.14);
+    color: #60a5fa;
 }
 
 .relay-base-url {

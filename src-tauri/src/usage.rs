@@ -430,6 +430,130 @@ impl UsageFetcher {
         })
     }
 
+    /// new-api 风格的 dashboard usage：
+    ///   `GET <base>/v1/dashboard/billing/subscription` →
+    ///       `{ soft_limit_usd, hard_limit_usd, access_until }`（与 OpenAI SDK 对齐）
+    ///   `GET <base>/v1/dashboard/billing/usage` →
+    ///       `{ total_usage }`（单位 0.01 美元）
+    ///
+    /// 覆盖：PinCC / PackyCode / AICodeMirror / 自建 new-api 等所有基于
+    /// QuantumNous/new-api 的中转。`Authorization: Bearer <sk-key>` 即可。
+    pub async fn fetch_relay_usage_new_api_dashboard(
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<crate::account::RelayUsageCache, String> {
+        let base = base_url.trim_end_matches('/');
+        let client = reqwest::Client::new();
+
+        let sub_url = format!("{}/v1/dashboard/billing/subscription", base);
+        let sub_resp = client
+            .get(&sub_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("subscription 请求失败: {}", e))?;
+        if !sub_resp.status().is_success() {
+            let body_preview = sub_resp
+                .text()
+                .await
+                .map(|s| s.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            return Err(format!("HTTP {} @ {} → {}", "subscription", sub_url, body_preview));
+        }
+        let sub_body: Value = sub_resp
+            .json()
+            .await
+            .map_err(|e| format!("subscription JSON 解析失败: {}", e))?;
+        let soft_limit_usd = sub_body
+            .get("soft_limit_usd")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| "subscription 缺 soft_limit_usd 字段".to_string())?;
+
+        let usage_url = format!("{}/v1/dashboard/billing/usage", base);
+        let usage_resp = client
+            .get(&usage_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("usage 请求失败: {}", e))?;
+        let total_usage_cents = if usage_resp.status().is_success() {
+            let body: Value = usage_resp
+                .json()
+                .await
+                .map_err(|e| format!("usage JSON 解析失败: {}", e))?;
+            body.get("total_usage").and_then(|v| v.as_f64()).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let remaining_usd = (soft_limit_usd - total_usage_cents / 100.0).max(0.0);
+
+        Ok(crate::account::RelayUsageCache {
+            remaining: remaining_usd,
+            unit: "USD".to_string(),
+            is_active: remaining_usd > 0.0,
+            next_reset_at: None,
+            updated_at: chrono::Utc::now(),
+        })
+    }
+
+    /// 自动探测中转站的 usage fetcher：依次尝试 new-api / openai_compat。
+    /// 命中返回 fetcher 名（写回 `account.relay_usage_preset` 持久化），
+    /// 都失败返回 None（用户看到"不拉取"）。
+    ///
+    /// 只发 GET 请求，不会改上游状态；4xx 不算命中（key 无效另当别论）。
+    pub async fn probe_relay_usage_preset(base_url: &str, api_key: &str) -> Option<String> {
+        let base = base_url.trim_end_matches('/');
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .ok()?;
+
+        // 1) new-api 风格：/v1/dashboard/billing/subscription
+        let url = format!("{}/v1/dashboard/billing/subscription", base);
+        if let Ok(resp) = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<Value>().await {
+                    if v.get("soft_limit_usd").is_some() || v.get("hard_limit_usd").is_some() {
+                        return Some("new_api_dashboard".to_string());
+                    }
+                }
+            }
+        }
+
+        // 2) sub2api / 通用 OpenAI 兼容：/v1/usage
+        let url = format!("{}/v1/usage", base);
+        if let Ok(resp) = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<Value>().await {
+                    let has_field = v.get("remaining").is_some()
+                        || v.get("balance").is_some()
+                        || v.pointer("/quota/remaining").is_some();
+                    if has_field {
+                        return Some("openai_compat".to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// GLM / 智谱 monitor quota：`GET https://<host>/api/monitor/usage/quota/limit` with Bearer。
     ///
     /// 输入 `base_url` 通常是 OpenAI 兼容根（如 `https://open.bigmodel.cn/api/paas/v4`），
@@ -545,6 +669,191 @@ impl UsageFetcher {
             updated_at: chrono::Utc::now(),
         })
     }
+
+    /// Xiaomi MiMo Token Plan usage：MiMo 当前没有公开的 tp-key 配额接口。
+    ///
+    /// 这里复用网页登录态 Cookie 访问控制台接口：
+    /// - GET https://platform.xiaomimimo.com/api/v1/tokenPlan/usage
+    /// - GET https://platform.xiaomimimo.com/api/v1/tokenPlan/detail
+    ///
+    /// `usage.monthUsage.items[0].percent` 是已用比例（0.0505 = 5.05%），
+    /// RelayUsageCache.remaining 仍按现有 UI 语义保存"剩余百分比"。
+    pub async fn fetch_relay_usage_mimo_token_plan(
+        cookie_header: &str,
+    ) -> Result<crate::account::RelayUsageCache, String> {
+        let cookie = Self::normalize_mimo_cookie_header(cookie_header)
+            .ok_or_else(|| "MiMo Cookie 缺少 api-platform_serviceToken 或 userId".to_string())?;
+
+        let client = reqwest::Client::new();
+        let usage_url = "https://platform.xiaomimimo.com/api/v1/tokenPlan/usage";
+        let detail_url = "https://platform.xiaomimimo.com/api/v1/tokenPlan/detail";
+
+        let usage_body = Self::fetch_mimo_console_json(&client, usage_url, &cookie).await?;
+        let detail_body = Self::fetch_mimo_console_json(&client, detail_url, &cookie)
+            .await
+            .ok();
+
+        let code = usage_body.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+        if code != 0 {
+            let msg = usage_body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("non-zero code");
+            return Err(format!("MiMo usage code={} msg={}", code, msg));
+        }
+
+        let item = usage_body
+            .get("data")
+            .and_then(|d| d.get("monthUsage"))
+            .and_then(|m| m.get("items"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .ok_or_else(|| "MiMo usage 响应缺 monthUsage.items".to_string())?;
+
+        let used = item.get("used").and_then(Self::parse_number).unwrap_or(0.0);
+        let limit = item
+            .get("limit")
+            .and_then(Self::parse_number)
+            .unwrap_or(0.0);
+        let used_pct_fraction = item
+            .get("percent")
+            .and_then(Self::parse_number)
+            .or_else(|| {
+                usage_body
+                    .get("data")
+                    .and_then(|d| d.get("monthUsage"))
+                    .and_then(|m| m.get("percent"))
+                    .and_then(Self::parse_number)
+            })
+            .or_else(|| {
+                if limit > 0.0 {
+                    Some(used / limit)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| "MiMo usage 响应缺 percent/used/limit".to_string())?;
+
+        let used_pct = if used_pct_fraction <= 1.0 {
+            used_pct_fraction * 100.0
+        } else {
+            used_pct_fraction
+        };
+        let remaining_pct = (100.0 - used_pct).clamp(0.0, 100.0);
+
+        let next_reset_at = detail_body
+            .as_ref()
+            .and_then(|body| body.get("data"))
+            .and_then(|data| data.get("currentPeriodEnd"))
+            .and_then(|v| v.as_str())
+            .and_then(Self::parse_mimo_period_end);
+
+        Ok(crate::account::RelayUsageCache {
+            remaining: remaining_pct,
+            unit: "% MiMo Credits".to_string(),
+            is_active: remaining_pct > 0.0,
+            next_reset_at,
+            updated_at: chrono::Utc::now(),
+        })
+    }
+
+    async fn fetch_mimo_console_json(
+        client: &reqwest::Client,
+        url: &str,
+        cookie: &str,
+    ) -> Result<Value, String> {
+        let resp = client
+            .get(url)
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .header("Cookie", cookie)
+            .header("Origin", "https://platform.xiaomimimo.com")
+            .header(
+                "Referer",
+                "https://platform.xiaomimimo.com/#/console/balance",
+            )
+            .header("x-timeZone", "Asia/Shanghai")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            )
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("MiMo usage 请求失败: {}", e))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("MiMo 登录态已失效，请重新登录后复制 Cookie".to_string());
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err("MiMo Cookie 无效或权限不足".to_string());
+        }
+        if !status.is_success() {
+            let body_preview = resp
+                .text()
+                .await
+                .map(|s| s.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            return Err(format!(
+                "HTTP {} @ {} → {}",
+                status.as_u16(),
+                url,
+                body_preview
+            ));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("MiMo usage JSON 解析失败: {}", e))
+    }
+
+    fn normalize_mimo_cookie_header(raw: &str) -> Option<String> {
+        let mut text = raw.trim();
+        let lower = text.to_ascii_lowercase();
+        if let Some(idx) = lower.find("cookie:") {
+            text = &text[idx + "cookie:".len()..];
+        }
+        if let Some(line) = text.lines().next() {
+            text = line;
+        }
+        let text = text
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"' || c == '`' || c == '\\');
+
+        let known = [
+            "api-platform_ph",
+            "api-platform_serviceToken",
+            "api-platform_slh",
+            "userId",
+        ];
+        let required = ["api-platform_serviceToken", "userId"];
+        let mut values = std::collections::BTreeMap::<String, String>::new();
+        for pair in text.split(';') {
+            let Some((name, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
+            if known.contains(&name) && !value.is_empty() {
+                values.insert(name.to_string(), value.to_string());
+            }
+        }
+        if !required.iter().all(|name| values.contains_key(*name)) {
+            return None;
+        }
+        Some(
+            values
+                .into_iter()
+                .map(|(name, value)| format!("{}={}", name, value))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
+    fn parse_mimo_period_end(value: &str) -> Option<i64> {
+        chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|dt| dt.and_utc().timestamp())
+    }
 }
 
 #[cfg(test)]
@@ -657,5 +966,29 @@ mod tests {
     fn glm_quota_skips_when_code_not_200() {
         let body = json!({"code": 401, "message": "unauthorized"});
         assert!(parse_glm_quota(body).is_none());
+    }
+
+    #[test]
+    fn mimo_cookie_normalizer_keeps_required_console_cookies() {
+        let raw =
+            "Cookie: ignored=x; userId=123; api-platform_serviceToken=svc; api-platform_ph=ph";
+        let normalized = UsageFetcher::normalize_mimo_cookie_header(raw).unwrap();
+        assert_eq!(
+            normalized,
+            "api-platform_ph=ph; api-platform_serviceToken=svc; userId=123"
+        );
+    }
+
+    #[test]
+    fn mimo_cookie_normalizer_rejects_missing_auth_cookie() {
+        assert!(UsageFetcher::normalize_mimo_cookie_header("Cookie: userId=123").is_none());
+    }
+
+    #[test]
+    fn mimo_period_end_parser_reads_console_timestamp() {
+        assert_eq!(
+            UsageFetcher::parse_mimo_period_end("2026-05-04 23:59:59"),
+            Some(1_778_025_599)
+        );
     }
 }

@@ -51,18 +51,50 @@ pub fn invalidate_cached_url() {
 }
 
 async fn probe(url: &str) -> bool {
+    // `.no_proxy()` 极重要：Server 永远是 LAN/ZeroTier 私有 IP，必须绕开系统代理。
+    // 默认 reqwest 会读 macOS 系统代理（如用户开了 Clash 监听 127.0.0.1:7890）
+    // 把所有 HTTP 请求都路由过去，Clash 处理不了 192.168/172.16 私有 IP → timeout。
     let Ok(c) = Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
         .build()
     else {
+        eprintln!("[remote_client] probe: client builder 失败 url={}", url);
         return false;
     };
     let probe_url = format!("{}/health", trim_url(url));
-    c.get(probe_url)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    let t0 = std::time::Instant::now();
+    match c.get(&probe_url).send().await {
+        Ok(r) => {
+            let ok = r.status().is_success();
+            eprintln!(
+                "[remote_client] probe {} → HTTP {} ok={} t={:?}",
+                probe_url,
+                r.status().as_u16(),
+                ok,
+                t0.elapsed()
+            );
+            ok
+        }
+        Err(e) => {
+            // 把 reqwest 的完整错误链打出来，能区分 timeout / connect refused /
+            // permission denied (macOS Sequoia Local Network) / DNS 等。
+            let mut chain = format!("{}", e);
+            let mut source = std::error::Error::source(&e);
+            while let Some(s) = source {
+                chain.push_str(" | caused by: ");
+                chain.push_str(&format!("{}", s));
+                source = s.source();
+            }
+            eprintln!(
+                "[remote_client] probe {} → ERR ({}) t={:?}",
+                probe_url,
+                chain,
+                t0.elapsed()
+            );
+            false
+        }
+    }
 }
 
 /// 从 primary 和 fallback 中挑一个可用地址，带 60s 缓存。
@@ -119,7 +151,9 @@ pub struct RemoteQuotaEntry {
 }
 
 fn client() -> Result<Client, String> {
+    // 同 probe()：绕开系统代理，避免 Clash 截走 LAN/ZeroTier 流量。
     Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("构建 HTTP client 失败: {}", e))

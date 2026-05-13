@@ -9,6 +9,20 @@ const KIND_BADGE: Record<ReturnType<typeof effectiveKind>, { label: string; clas
     openai_key: { label: 'API', className: 'badge kind-openai' },
     relay: { label: '中转', className: 'badge kind-relay' },
 };
+
+/** Relay 类账号在 row 上展示哪个标签。新字段 `relay_category` 是权威来源，
+ * 缺失时回退到通用"中转"。 */
+function relayCategoryBadge(account: Account): { label: string; className: string } {
+    switch (account.relay_category) {
+        case 'coding_plan':
+            return { label: 'Plan', className: 'badge kind-codingplan' };
+        case 'third_party':
+            return { label: '三方', className: 'badge kind-thirdparty' };
+        case 'aggregator':
+        default:
+            return { label: '中转', className: 'badge kind-relay' };
+    }
+}
 import { useShortCountdown } from '../hooks/useCountdown';
 import './AccountList.css';
 import { ConfirmModal } from './ConfirmModal';
@@ -26,7 +40,7 @@ interface UsageData {
     is_valid_for_cli: boolean;
 }
 
-type FilterType = 'all' | 'plus' | 'pro' | 'team' | 'free' | 'relay';
+type FilterType = 'all' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
 
 interface AccountListProps {
     accounts: Account[];
@@ -37,6 +51,7 @@ interface AccountListProps {
     onUpdateSettings: (settings: AppSettings) => void;
     onRefreshComplete?: () => void;
     onAddAccount?: () => void;
+    onAddRelay?: () => void;
     onRefreshUsage?: () => void;
     usageLoading?: boolean;
 }
@@ -47,6 +62,7 @@ export function AccountList({
     settings,
     onSwitch,
     onAddAccount,
+    onAddRelay,
     onRefreshUsage,
     usageLoading,
     onDelete,
@@ -68,6 +84,8 @@ export function AccountList({
     const [pushToast, setPushToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     // Relay 类型账号的余额缓存（与 ChatGPT usage 独立）
     const [relayUsageMap, setRelayUsageMap] = useState<Record<string, RelayUsageCache>>({});
+    const [cookieEditor, setCookieEditor] = useState<{ id: string; name: string; value: string } | null>(null);
+    const [savingCookie, setSavingCookie] = useState(false);
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
@@ -127,9 +145,14 @@ export function AccountList({
 
         if (filter !== 'all') {
             result = result.filter(a => {
-                if (filter === 'relay') return effectiveKind(a) === 'relay';
+                // Relay 类账号现在按 relay_category 分流
+                const isRelay = effectiveKind(a) === 'relay';
+                if (filter === 'relay') return isRelay && (a.relay_category ?? 'aggregator') === 'aggregator';
+                if (filter === 'coding_plan') return isRelay && a.relay_category === 'coding_plan';
+                if (filter === 'third_party') return isRelay && a.relay_category === 'third_party';
+                if (isRelay) return false; // 其它 plan 过滤胶囊只看订阅类
                 const type = usageMap[a.id]?.plan_type?.toLowerCase() || '';
-                if (filter === 'pro') return type.includes('pro'); // 含 pro / prolite
+                if (filter === 'pro') return type.includes('pro');
                 if (filter === 'plus') return type.includes('plus');
                 if (filter === 'team') return type.includes('team');
                 if (filter === 'free') return type && !type.includes('pro') && !type.includes('plus') && !type.includes('team');
@@ -140,10 +163,13 @@ export function AccountList({
     }, [accounts, searchQuery, filter, usageMap]);
 
     const filterCounts = useMemo(() => {
-        const counts = { all: accounts.length, pro: 0, plus: 0, team: 0, free: 0, relay: 0 };
+        const counts = { all: accounts.length, pro: 0, plus: 0, team: 0, free: 0, relay: 0, coding_plan: 0, third_party: 0 };
         accounts.forEach(a => {
             if (effectiveKind(a) === 'relay') {
-                counts.relay++;
+                const cat = a.relay_category ?? 'aggregator';
+                if (cat === 'coding_plan') counts.coding_plan++;
+                else if (cat === 'third_party') counts.third_party++;
+                else counts.relay++;
                 return;
             }
             const type = usageMap[a.id]?.plan_type?.toLowerCase() || '';
@@ -239,13 +265,66 @@ export function AccountList({
         }
     };
 
+    const handleSaveUsageCookie = async () => {
+        if (!cookieEditor) return;
+        setSavingCookie(true);
+        try {
+            await invoke('update_relay_usage_cookie', {
+                id: cookieEditor.id,
+                usageCookie: cookieEditor.value.trim() || null,
+            });
+            setRelayUsageMap(prev => {
+                const next = { ...prev };
+                delete next[cookieEditor.id];
+                return next;
+            });
+            const id = cookieEditor.id;
+            setCookieEditor(null);
+            await handleRefreshOne(id);
+        } catch (e) {
+            setPushToast({ type: 'error', text: `保存 MiMo Cookie 失败: ${e}` });
+            setTimeout(() => setPushToast(null), 4000);
+        } finally {
+            setSavingCookie(false);
+        }
+    };
+
     /// Relay 余额展示：
     /// - unit 是 `%` → 进度条 mini-card（GLM 这种百分比模型）
     /// - 其它（USD/CNY 等金额） → 纯文本 mini-card（unity2 等返回金额的）
-    const RelayQuotaItem = ({ cache }: { cache: RelayUsageCache | undefined }) => {
+    const RelayQuotaItem = ({ account, cache }: { account: Account; cache: RelayUsageCache | undefined }) => {
+        const isMiMoRelay = [
+            account.relay_usage_preset,
+            account.relay_base_url,
+            account.relay_homepage,
+            account.name,
+        ].some(v => (v ?? '').toLowerCase().includes('mimo') || (v ?? '').toLowerCase().includes('xiaomimimo'));
+        const canEditCookie = isMiMoRelay;
+        const openCookieEditor = () => {
+            if (!canEditCookie) return;
+            setCookieEditor({
+                id: account.id,
+                name: account.name,
+                value: account.relay_usage_cookie ?? '',
+            });
+        };
+        const editableProps = canEditCookie
+            ? {
+                role: 'button',
+                tabIndex: 0,
+                title: '点击修改 MiMo 配额 Cookie',
+                onClick: openCookieEditor,
+                onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        openCookieEditor();
+                    }
+                },
+            }
+            : {};
         if (!cache) {
             return (
-                <div className="quota-grid">
+                <div className="quota-grid" {...editableProps}>
                     <QuotaItem label="Token 配额" percentage={undefined} reset={undefined} />
                 </div>
             );
@@ -254,7 +333,7 @@ export function AccountList({
         const isPercent = unit === '%' || unit.includes('%');
         if (isPercent) {
             return (
-                <div className="quota-grid">
+                <div className="quota-grid" {...editableProps}>
                     <QuotaItem
                         label="Token 配额"
                         percentage={cache.remaining}
@@ -267,7 +346,7 @@ export function AccountList({
         // 金额型：mini-card 风格但中间是数字+单位
         const tone = cache.is_active ? 'green' : 'red';
         return (
-            <div className="quota-grid">
+            <div className="quota-grid" {...editableProps}>
                 <div className="quota-mini-card">
                     <div className={`quota-mini-bg ${tone}`} style={{ width: '100%' }} />
                     <div className="quota-mini-content">
@@ -317,11 +396,23 @@ export function AccountList({
                     <input type="text" placeholder="搜索邮箱..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
                 </div>
                 <div className="filter-group">
-                    {(['all', 'pro', 'plus', 'team', 'free', 'relay'] as const).map(t => (
-                        <button key={t} className={`filter-btn filter-btn-compact ${filter === t ? 'active' : ''}`} onClick={() => setFilter(t)}>
-                            {t.toUpperCase()}<span className="filter-count">{filterCounts[t]}</span>
-                        </button>
-                    ))}
+                    {(['all', 'pro', 'plus', 'team', 'free', 'relay', 'coding_plan', 'third_party'] as const).map(t => {
+                        const isRelayLike = t === 'relay' || t === 'coding_plan' || t === 'third_party';
+                        const label = t === 'all' ? 'ALL'
+                            : t === 'coding_plan' ? 'Plan'
+                            : t === 'third_party' ? '三方'
+                            : t === 'relay' ? '中转'
+                            : t.toUpperCase();
+                        return (
+                            <button
+                                key={t}
+                                className={`filter-btn filter-btn-compact ${isRelayLike ? 'filter-btn--relay' : ''} ${filter === t ? 'active' : ''}`}
+                                onClick={() => setFilter(t)}
+                            >
+                                {label}<span className="filter-count">{filterCounts[t]}</span>
+                            </button>
+                        );
+                    })}
                 </div>
                 <div className="toolbar-spacer" />
                 <button
@@ -335,7 +426,16 @@ export function AccountList({
                     <button
                         className="toolbar-icon-btn toolbar-icon-btn-primary"
                         onClick={onAddAccount}
-                        title="添加账号"
+                        title="登录账号 (OpenAI / OTP / 导入)"
+                    >
+                        <Plus size={16} />
+                    </button>
+                )}
+                {onAddRelay && (
+                    <button
+                        className="toolbar-icon-btn toolbar-icon-btn-relay"
+                        onClick={onAddRelay}
+                        title="添加中转 (Coding Plan / 通用 Responses 中转)"
                     >
                         <Plus size={16} />
                     </button>
@@ -388,8 +488,16 @@ export function AccountList({
                                 <div className="col-email" title="点击复制账号">
                                     {(() => {
                                         const isRelay = effectiveKind(acc) === 'relay';
+                                        const isMiMoRelay = [
+                                            acc.relay_usage_preset,
+                                            acc.relay_base_url,
+                                            acc.relay_homepage,
+                                            acc.name,
+                                        ].some(v => (v ?? '').toLowerCase().includes('mimo') || (v ?? '').toLowerCase().includes('xiaomimimo'));
                                         const link = isRelay
-                                            ? (acc.relay_homepage || acc.relay_base_url || '')
+                                            ? (isMiMoRelay
+                                                ? 'https://platform.xiaomimimo.com/console/plan-manage'
+                                                : (acc.relay_homepage || acc.relay_base_url || ''))
                                             : '';
                                         const onNameClick = (e: React.MouseEvent) => {
                                             // Relay：点击账号名打开主页/base_url；其它：复制
@@ -415,7 +523,7 @@ export function AccountList({
                                     <div className="badges" style={{ display: 'flex', gap: '4px', marginLeft: '8px', flexWrap: 'wrap' }}>
                                         {(() => {
                                             const k = effectiveKind(acc);
-                                            const meta = KIND_BADGE[k];
+                                            const meta = k === 'relay' ? relayCategoryBadge(acc) : KIND_BADGE[k];
                                             return <span className={meta.className}>{meta.label}</span>;
                                         })()}
                                         {copiedId === acc.id && <span className="badge copy-success">已复制</span>}
@@ -426,7 +534,7 @@ export function AccountList({
                                 </div>
                                 <div className="col-quota-merged">
                                     {effectiveKind(acc) === 'relay' ? (
-                                        <RelayQuotaItem cache={relayUsageMap[acc.id]} />
+                                        <RelayQuotaItem account={acc} cache={relayUsageMap[acc.id]} />
                                     ) : usage ? (
                                         <div className="quota-grid">
                                             <QuotaItem label={usage.five_hour_label} percentage={usage.five_hour_left} reset={usage.five_hour_reset} resetAt={usage.five_hour_reset_at} />
@@ -490,6 +598,41 @@ export function AccountList({
                 }}
                 onCancel={() => setAccountToDelete(null)}
             />
+            {cookieEditor && (
+                <div className="modal-overlay" onClick={() => !savingCookie && setCookieEditor(null)}>
+                    <div className="modal-content" onClick={e => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <div className="header-top">
+                                <h2>修改 MiMo 配额 Cookie</h2>
+                                <button className="close-btn" onClick={() => setCookieEditor(null)} disabled={savingCookie}>
+                                    ×
+                                </button>
+                            </div>
+                        </div>
+                        <div className="modal-body">
+                            <p className="modal-tip" style={{ marginBottom: 12 }}>
+                                账号：{cookieEditor.name}。登录 <code>platform.xiaomimimo.com</code> 后，从 Network 请求里复制 <code>Cookie:</code> header。
+                            </p>
+                            <textarea
+                                value={cookieEditor.value}
+                                onChange={e => setCookieEditor(prev => prev ? { ...prev, value: e.target.value } : prev)}
+                                rows={5}
+                                placeholder="Cookie: api-platform_serviceToken=...; userId=...; api-platform_ph=..."
+                                style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12, width: '100%' }}
+                                disabled={savingCookie}
+                            />
+                        </div>
+                        <div className="modal-footer">
+                            <button type="button" className="btn btn-ghost" onClick={() => setCookieEditor(null)} disabled={savingCookie}>
+                                取消
+                            </button>
+                            <button type="button" className="btn btn-primary" onClick={handleSaveUsageCookie} disabled={savingCookie}>
+                                {savingCookie ? '保存中…' : '保存并刷新'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

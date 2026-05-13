@@ -7,6 +7,7 @@ import { writeTextFile } from '@tauri-apps/plugin-fs';
 import { useAccounts } from './hooks/useAccounts';
 import { useUsage } from './hooks/useUsage';
 import { AddAccountModal } from './components/AddAccountModal';
+import { AddRelayModal } from './components/AddRelayModal';
 import { Dashboard } from './components/Dashboard';
 import { AccountList } from './components/AccountList';
 import { Settings } from './components/Settings';
@@ -56,6 +57,7 @@ function App() {
     localStorage.setItem('currentPage', currentPage);
   }, [currentPage]);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showRelayModal, setShowRelayModal] = useState(false);
   const [schedulerError, setSchedulerError] = useState<string | null>(null);
 
   // 冲突确认弹窗状态
@@ -351,7 +353,10 @@ function App() {
 
         <div className="header-actions">
           <button className="btn btn-primary" onClick={() => setShowAddModal(true)}>
-            + 添加账号
+            + 登录账号
+          </button>
+          <button className="btn btn-relay" onClick={() => setShowRelayModal(true)}>
+            + 添加中转
           </button>
         </div>
       </header>
@@ -423,6 +428,7 @@ function App() {
             onUpdateSettings={updateSettings}
             onRefreshComplete={refresh}
             onAddAccount={() => setShowAddModal(true)}
+            onAddRelay={() => setShowRelayModal(true)}
             onRefreshUsage={refreshUsage}
             usageLoading={usageLoading}
           />
@@ -443,6 +449,12 @@ function App() {
         isOpen={showAddModal}
         onClose={() => setShowAddModal(false)}
         onAdd={importCurrent}
+        onSuccess={refresh}
+      />
+
+      <AddRelayModal
+        isOpen={showRelayModal}
+        onClose={() => setShowRelayModal(false)}
         onSuccess={refresh}
       />
 

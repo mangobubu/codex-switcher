@@ -285,9 +285,9 @@ export function Settings() {
 
                 <div className="setting-item">
                     <div className="setting-info">
-                        <span className="setting-label">Relay 出问题时切回订阅号</span>
+                        <span className="setting-label">中转 / Plan / 三方 出问题时切回订阅号</span>
                         <span className="setting-desc">
-                            开启（默认）：current 是 Relay 时，遇到 401/429/quota 自动切到健康的订阅号，避免请求卡死。关闭后 Relay 出错会把错误透传给客户端，不偷换。
+                            开启（默认）：current 是中转 / Coding Plan / 三方 API 时，遇到 401/429/quota 自动切到健康的订阅号，避免请求卡死。关闭后这类号出错会把错误透传给客户端，不偷换。
                         </span>
                     </div>
                     <label className="toggle">
@@ -302,9 +302,9 @@ export function Settings() {
 
                 <div className="setting-item">
                     <div className="setting-info">
-                        <span className="setting-label">自动选号可挑中 Relay</span>
+                        <span className="setting-label">自动选号可挑中 中转 / Plan / 三方</span>
                         <span className="setting-desc">
-                            关闭（默认）：用订阅号时自动切号 / affinity 不会路由到 Relay，避免偷扣余额。开启后 Relay 跟订阅号同等参与轮询（量大但要确认你愿意花 Relay 的钱）。
+                            关闭（默认）：用订阅号时自动切号 / affinity 不会路由到中转 / Coding Plan / 三方 API，避免偷扣余额。开启后这类号跟订阅号同等参与轮询（量大但要确认你愿意花对应套餐的额度）。
                         </span>
                     </div>
                     <label className="toggle">

@@ -352,6 +352,11 @@ pub struct Account {
     #[serde(default)]
     pub relay_usage_preset: Option<String>,
 
+    /// Relay usage 专用网页登录 Cookie（MiMo Token Plan 等控制台配额接口使用）。
+    /// 不参与模型请求，只用于 `relay_usage_preset` 对应的配额 fetcher。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_usage_cookie: Option<String>,
+
     /// 中转站余额缓存
     #[serde(default)]
     pub relay_usage_cache: Option<RelayUsageCache>,
@@ -370,6 +375,15 @@ pub struct Account {
     /// - `"chat_completions"` —— 上游只懂 `/chat/completions`（GLM Coding Plan、通用 OpenAI 兼容）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_protocol: Option<String>,
+
+    /// 业务分类（UI 过滤胶囊 + 标签用）：
+    /// - `"aggregator"` —— 第三方聚合中转（基于 new-api / sub2api / CLIProxyAPI）
+    /// - `"coding_plan"` —— 厂商自家 Coding Plan / Token Plan 订阅
+    /// - `"third_party"` —— 厂商按量付费 API
+    ///
+    /// 老账号没这个字段；启动加载时按 `notes`（`from preset:<id>`）反推一次性 migrate。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_category: Option<String>,
 }
 
 impl Account {
@@ -582,8 +596,118 @@ impl AccountStore {
         if store.migrate_glm_usage_preset() {
             let _ = store.save();
         }
+        if store.migrate_mimo_plan_manage_homepage() {
+            let _ = store.save();
+        }
+        if store.migrate_relay_category() {
+            let _ = store.save();
+        }
 
         store
+    }
+
+    /// 一次性迁移：给老的 Relay 账号填上 `relay_category`。
+    /// 优先按 `notes` 里的 `from preset:<id>` 反查 preset id，否则按 base_url 启发式判断。
+    /// 不能识别的 fallback 到 `"aggregator"`（最保守的语义）。
+    fn migrate_relay_category(&mut self) -> bool {
+        let mut changed = false;
+        for acc in self.accounts.values_mut() {
+            if !matches!(acc.kind, AccountKind::Relay) {
+                continue;
+            }
+            if acc.relay_category.is_some() {
+                continue;
+            }
+            // 先看 notes 里的 from preset:<id>
+            let preset_id = acc
+                .notes
+                .as_deref()
+                .and_then(|n| n.split("from preset:").nth(1))
+                .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string());
+            // base_url 启发判 coding_plan（用户可能改过 preset 之后的 base，
+            // 比如 preset=glm 但实际 base 改成了 coding/paas/v4）。
+            // 这条 override 优先级最高。
+            let base = acc.relay_base_url.as_deref().unwrap_or("").to_lowercase();
+            let base_says_coding_plan = base.contains("xiaomimimo.com")
+                || base.contains("bigmodel.cn/api/coding")
+                || base.contains("token-plan");
+
+            let category = if base_says_coding_plan {
+                "coding_plan"
+            } else {
+                match preset_id.as_deref() {
+                    Some("glm_coding") | Some("mimo_token_plan_sgp") | Some("volcengine_ark")
+                    | Some("ucloud_modelverse") => "coding_plan",
+                    Some("generic_responses_relay") | Some("freemodel") | Some("custom") => {
+                        "aggregator"
+                    }
+                    Some("glm")
+                    | Some("deepseek_api")
+                    | Some("moonshot_kimi")
+                    | Some("minimax_api")
+                    | Some("alibaba_dashscope")
+                    | Some("tencent_hunyuan")
+                    | Some("baidu_qianfan")
+                    | Some("fireworks_ai")
+                    | Some("stepfun_step")
+                    | Some("openrouter") => "third_party",
+                    _ => {
+                        if base.contains("bigmodel.cn")
+                            || base.contains("deepseek.com")
+                            || base.contains("moonshot")
+                            || base.contains("minimax")
+                            || base.contains("dashscope")
+                            || base.contains("volces.com")
+                            || base.contains("hunyuan")
+                            || base.contains("baidubce")
+                            || base.contains("fireworks.ai")
+                            || base.contains("stepfun")
+                            || base.contains("openrouter")
+                        {
+                            "third_party"
+                        } else {
+                            "aggregator"
+                        }
+                    }
+                }
+            };
+            acc.relay_category = Some(category.to_string());
+            changed = true;
+            println!(
+                "[Migration] Relay 账号 {} category → {}",
+                acc.name, category
+            );
+        }
+        changed
+    }
+
+    /// 一次性迁移：旧 MiMo preset 的 homepage 曾指向 token-plan-sgp docs。
+    /// 账号名点击应进入订阅管理页，方便查看 Token Plan 并复制配额 Cookie。
+    fn migrate_mimo_plan_manage_homepage(&mut self) -> bool {
+        let mut changed = false;
+        for acc in self.accounts.values_mut() {
+            if !matches!(acc.kind, AccountKind::Relay) {
+                continue;
+            }
+            let haystack = format!(
+                "{} {} {} {}",
+                acc.name,
+                acc.relay_base_url.as_deref().unwrap_or(""),
+                acc.relay_homepage.as_deref().unwrap_or(""),
+                acc.relay_usage_preset.as_deref().unwrap_or("")
+            )
+            .to_lowercase();
+            if !(haystack.contains("mimo") || haystack.contains("xiaomimimo")) {
+                continue;
+            }
+            let target = "https://platform.xiaomimimo.com/console/plan-manage".to_string();
+            if acc.relay_homepage.as_deref() != Some(target.as_str()) {
+                acc.relay_homepage = Some(target);
+                changed = true;
+                println!("[Migration] MiMo 账号 {} homepage → plan-manage", acc.name);
+            }
+        }
+        changed
     }
 
     /// 一次性迁移：把已导入的 GLM 账号（base_url 含 `bigmodel.cn`）的
@@ -742,10 +866,12 @@ impl AccountStore {
             relay_base_url: None,
             relay_homepage: None,
             relay_usage_preset: None,
+            relay_usage_cookie: None,
             relay_usage_cache: None,
             relay_model_map: None,
             relay_model_fallback: None,
             relay_protocol: None,
+            relay_category: None,
         };
 
         self.accounts.insert(id.clone(), account.clone());
@@ -769,10 +895,12 @@ impl AccountStore {
         api_key: String,
         homepage: Option<String>,
         usage_preset: Option<String>,
+        usage_cookie: Option<String>,
         notes: Option<String>,
         model_map: Option<std::collections::HashMap<String, String>>,
         model_fallback: Option<String>,
         relay_protocol: Option<String>,
+        relay_category: Option<String>,
     ) -> Account {
         let id = uuid::Uuid::new_v4().to_string();
         let normalized_base = base_url.trim().trim_end_matches('/').to_string();
@@ -802,10 +930,12 @@ impl AccountStore {
             relay_base_url: Some(normalized_base),
             relay_homepage: homepage,
             relay_usage_preset: usage_preset,
+            relay_usage_cookie: usage_cookie,
             relay_usage_cache: None,
             relay_model_map: model_map,
             relay_model_fallback: model_fallback,
             relay_protocol,
+            relay_category,
         };
 
         self.accounts.insert(id.clone(), account.clone());
@@ -878,6 +1008,24 @@ impl AccountStore {
             account.notes = notes;
         }
 
+        Ok(())
+    }
+
+    /// 更新 Relay usage 专用 Cookie，并清掉旧 usage cache，避免 UI 显示旧配额。
+    pub fn update_relay_usage_cookie(
+        &mut self,
+        id: &str,
+        usage_cookie: Option<String>,
+    ) -> Result<(), String> {
+        let account = self
+            .accounts
+            .get_mut(id)
+            .ok_or_else(|| format!("账号不存在: {}", id))?;
+        if !account.is_relay() {
+            return Err("不是中转站账号".to_string());
+        }
+        account.relay_usage_cookie = usage_cookie;
+        account.relay_usage_cache = None;
         Ok(())
     }
 

@@ -525,6 +525,22 @@ fn update_account(
     Ok(())
 }
 
+/// 更新 Relay usage 专用 Cookie（MiMo Token Plan 等控制台配额接口使用）。
+#[tauri::command]
+fn update_relay_usage_cookie(
+    state: State<AppState>,
+    id: String,
+    usage_cookie: Option<String>,
+) -> Result<(), String> {
+    let normalized = usage_cookie
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    let mut store = state.store.lock().map_err(|e| e.to_string())?;
+    store.update_relay_usage_cookie(&id, normalized)?;
+    store.save()?;
+    Ok(())
+}
+
 /// 设置账号级”非活跃保活刷新”开关
 #[tauri::command]
 fn set_account_inactive_refresh_enabled(
@@ -675,10 +691,12 @@ async fn add_relay_account(
     api_key: String,
     homepage: Option<String>,
     usage_preset: Option<String>,
+    usage_cookie: Option<String>,
     notes: Option<String>,
     model_map: Option<std::collections::HashMap<String, String>>,
     model_fallback: Option<String>,
     relay_protocol: Option<String>,
+    relay_category: Option<String>,
 ) -> Result<Account, String> {
     let trimmed_url = base_url.trim();
     if !(trimmed_url.starts_with("https://") || trimmed_url.starts_with("http://")) {
@@ -703,6 +721,9 @@ async fn add_relay_account(
             usage_preset
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty()),
+            usage_cookie
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty()),
             notes,
             model_map,
             model_fallback
@@ -711,6 +732,9 @@ async fn add_relay_account(
             relay_protocol
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty()),
+            relay_category
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty()),
         );
         store.save()?;
         let push = account::pushes_to_server(&store.settings.remote_mode);
@@ -786,7 +810,7 @@ async fn refresh_relay_usage(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<account::RelayUsageCache, String> {
-    let (base_url, api_key, preset) = {
+    let (base_url, api_key, preset, usage_cookie) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let acc = store.accounts.get(&id).ok_or("账号不存在")?;
         if !acc.is_relay() {
@@ -796,15 +820,45 @@ async fn refresh_relay_usage(
         let key =
             AccountStore::extract_access_token(&acc.auth_json).ok_or("中转站账号缺 api_key")?;
         let preset = acc.relay_usage_preset.clone();
-        (base, key, preset)
+        let usage_cookie = acc.relay_usage_cookie.clone();
+        (base, key, preset, usage_cookie)
     };
 
-    let cache = match preset.as_deref() {
-        Some("openai_compat") | None => {
+    // "auto" 或缺省 → 探测：先 new-api dashboard，再 openai_compat；
+    // 探测命中后把策略写回 acc.relay_usage_preset，下次直接走对应 fetcher。
+    let needs_probe = matches!(preset.as_deref(), None | Some("auto"));
+    let effective_preset: Option<String> = if needs_probe {
+        match UsageFetcher::probe_relay_usage_preset(&base_url, &api_key).await {
+            Some(p) => {
+                if let Ok(mut store) = state.store.lock() {
+                    if let Some(acc) = store.accounts.get_mut(&id) {
+                        acc.relay_usage_preset = Some(p.clone());
+                        let _ = store.save();
+                    }
+                }
+                Some(p)
+            }
+            None => return Err("自动探测未命中：上游不支持 /v1/dashboard/billing 或 /v1/usage（可手动选 usage 策略，或保持「不拉取」）".to_string()),
+        }
+    } else {
+        preset
+    };
+
+    let cache = match effective_preset.as_deref() {
+        Some("openai_compat") => {
             UsageFetcher::fetch_relay_usage_openai_compat(&base_url, &api_key).await?
         }
+        Some("new_api_dashboard") => {
+            UsageFetcher::fetch_relay_usage_new_api_dashboard(&base_url, &api_key).await?
+        }
         Some("glm_zhipu") => UsageFetcher::fetch_relay_usage_glm_zhipu(&base_url, &api_key).await?,
+        Some("mimo_token_plan") => {
+            let cookie = usage_cookie
+                .ok_or("MiMo 配额查询需要登录 platform.xiaomimimo.com 后复制 Cookie header")?;
+            UsageFetcher::fetch_relay_usage_mimo_token_plan(&cookie).await?
+        }
         Some(other) => return Err(format!("未支持的 usage_preset: {}", other)),
+        None => return Err("usage 策略未确定".to_string()),
     };
 
     {
@@ -4619,6 +4673,7 @@ pub fn run() {
             sync_current_auth_to_account,
             delete_account,
             update_account,
+            update_relay_usage_cookie,
             set_account_inactive_refresh_enabled,
             export_accounts,
             import_accounts,
@@ -4738,10 +4793,12 @@ mod tests {
             relay_base_url: None,
             relay_homepage: None,
             relay_usage_preset: None,
+            relay_usage_cookie: None,
             relay_usage_cache: None,
             relay_model_map: None,
             relay_model_fallback: None,
             relay_protocol: None,
+            relay_category: None,
         }
     }
 

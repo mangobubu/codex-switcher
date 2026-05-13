@@ -53,6 +53,7 @@ pub struct TranslatorState {
     // Streaming state (mutated by handle_chunk):
     seq_num: u64,
     full_content: String,
+    full_reasoning_content: String,
     message_idx: Option<usize>,
     item_id: Option<String>,
     next_idx: usize,
@@ -81,6 +82,7 @@ impl TranslatorState {
             request_metadata,
             seq_num: 0,
             full_content: String::new(),
+            full_reasoning_content: String::new(),
             message_idx: None,
             item_id: None,
             next_idx: 0,
@@ -156,7 +158,7 @@ pub fn translate_request(
     let mut payload = prepare_payload(&data, model_after_rewrite);
 
     // Step 3: transform payload (developer→system, strip strict, web_search shape)
-    transform_payload(&mut payload);
+    transform_payload(&mut payload, model_after_rewrite);
 
     let bytes =
         serde_json::to_vec(&payload).map_err(|e| TranslateError::Serialize(e.to_string()))?;
@@ -362,6 +364,32 @@ fn process_reasoning_item(item: &Value, messages: &mut Vec<Value>) {
                 _ => {}
             }
         }
+    }
+    if let Some(arr) = item.get("summary").and_then(Value::as_array) {
+        for cp in arr {
+            match cp {
+                Value::String(s) => content.push_str(s),
+                Value::Object(obj) => {
+                    if let Some(Value::String(t)) = obj.get("text") {
+                        content.push_str(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if content.is_empty() {
+        if let Some(s) = item.get("summary_text").and_then(Value::as_str) {
+            content.push_str(s);
+        }
+    }
+    if content.is_empty() {
+        if let Some(s) = item.get("reasoning_content").and_then(Value::as_str) {
+            content.push_str(s);
+        }
+    }
+    if content.is_empty() {
+        return;
     }
     let amsg = ensure_last_assistant(messages);
     let amsg_obj = amsg.as_object_mut().expect("assistant is object");
@@ -615,11 +643,13 @@ fn prepare_payload(data: &Value, model: &str) -> Value {
     Value::Object(payload)
 }
 
-fn transform_payload(payload: &mut Value) {
+fn transform_payload(payload: &mut Value, model_after_rewrite: &str) {
     let obj = match payload.as_object_mut() {
         Some(o) => o,
         None => return,
     };
+    let is_mimo = is_mimo_model(model_after_rewrite);
+    let is_glm = is_glm_model(model_after_rewrite);
 
     // Fix roles: developer → system
     if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
@@ -628,7 +658,74 @@ fn transform_payload(payload: &mut Value) {
                 if mo.get("role").and_then(Value::as_str) == Some("developer") {
                     mo.insert("role".to_string(), Value::String("system".into()));
                 }
+                if is_mimo && mo.get("role").and_then(Value::as_str) == Some("assistant") {
+                    mo.entry("reasoning_content".to_string())
+                        .or_insert_with(|| Value::String(String::new()));
+                }
             }
+        }
+    }
+
+    // MiMo-only: drop any assistant message with tool_calls but empty
+    // reasoning_content (and the tool result messages that follow it).
+    // MiMo's thinking-mode strict check rejects a multi-turn history that
+    // contains assistant turns missing reasoning_content with the cryptic
+    // 400 "unexpected character: line 1 column 1 (char 0)" error. Codex CLI
+    // 0.130+ keeps reasoning in `encrypted_content` and doesn't surface
+    // plaintext reasoning back into `/v1/responses`, so most historical
+    // assistant turns arrive here with empty reasoning_content.
+    //
+    // Short-term workaround: silently drop those incomplete turns. We lose
+    // tool-call history but the conversation can continue. The long-term
+    // fix is to round-trip MiMo's reasoning through codex's encrypted_content
+    // (see memory: mimo_reasoning_content_strict).
+    if is_mimo {
+        if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+            let original = std::mem::take(messages);
+            let mut kept: Vec<Value> = Vec::with_capacity(original.len());
+            let mut iter = original.into_iter().peekable();
+            let mut dropped_assistant = 0u32;
+            let mut dropped_tool = 0u32;
+            while let Some(msg) = iter.next() {
+                let drop_this = msg
+                    .as_object()
+                    .map(|mo| {
+                        let is_assistant =
+                            mo.get("role").and_then(Value::as_str) == Some("assistant");
+                        let has_tool_calls = mo
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .map(|a| !a.is_empty())
+                            .unwrap_or(false);
+                        let rc_empty = mo
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .map(|s| s.is_empty())
+                            .unwrap_or(true);
+                        is_assistant && has_tool_calls && rc_empty
+                    })
+                    .unwrap_or(false);
+                if !drop_this {
+                    kept.push(msg);
+                    continue;
+                }
+                dropped_assistant += 1;
+                while let Some(next) = iter.peek() {
+                    if next.get("role").and_then(Value::as_str) == Some("tool") {
+                        iter.next();
+                        dropped_tool += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if dropped_assistant > 0 || dropped_tool > 0 {
+                eprintln!(
+                    "[relay_translate] MiMo: dropped {} empty-reasoning assistant + {} tool follow-ups from history",
+                    dropped_assistant, dropped_tool
+                );
+            }
+            *messages = kept;
         }
     }
 
@@ -647,13 +744,26 @@ fn transform_payload(payload: &mut Value) {
                         transformed.push(t);
                     }
                     Some("web_search") => {
-                        transformed.push(json!({
-                            "type": "web_search",
-                            "web_search": {
-                                "enable": true,
-                                "search_engine": "search_pro_jina",
-                            }
-                        }));
+                        // `web_search` is a codex CLI native tool, but every upstream
+                        // exposes its own (incompatible) builtin shape — there is no
+                        // generic OpenAI-Chat equivalent. Only GLM's `search_pro_jina`
+                        // builtin is wired up here; MiMo's needs a separately-billed
+                        // plugin (see docs/integration/mimo). Drop it for everyone
+                        // else — codex CLI falls back to shell/other tools.
+                        if is_glm {
+                            transformed.push(json!({
+                                "type": "web_search",
+                                "web_search": {
+                                    "enable": true,
+                                    "search_engine": "search_pro_jina",
+                                }
+                            }));
+                        } else {
+                            eprintln!(
+                                "[relay_translate] dropping web_search tool (no native shape for model={})",
+                                model_after_rewrite
+                            );
+                        }
                     }
                     other => {
                         // codex CLI sends private tool types (local_shell, apply_patch,
@@ -673,6 +783,19 @@ fn transform_payload(payload: &mut Value) {
             *arr = transformed;
         }
     }
+
+    // Debug: dump translated body to /tmp for inspection
+    if let Ok(debug_bytes) = serde_json::to_vec(&obj) {
+        let _ = std::fs::write("/tmp/codex-relay-translate-debug.json", &debug_bytes);
+    }
+}
+
+fn is_mimo_model(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("mimo-")
+}
+
+fn is_glm_model(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("glm-")
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -858,6 +981,7 @@ pub fn handle_chunk(state: &mut TranslatorState, chunk: &[u8]) -> Vec<Vec<u8>> {
     // 2) Reasoning content (GLM extension; not in Python reference)
     if let Some(rc) = delta.get("reasoning_content").and_then(Value::as_str) {
         if !rc.is_empty() {
+            state.full_reasoning_content.push_str(rc);
             if state.reasoning_idx.is_none() {
                 let idx = state.next_idx;
                 state.next_idx += 1;
@@ -1001,7 +1125,7 @@ pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
             json!({
                 "id": item_id,
                 "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": ""}],
+                "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
             }),
         ));
     }
@@ -1097,7 +1221,7 @@ fn collect_final_output(state: &TranslatorState) -> Value {
             json!({
                 "id": item_id,
                 "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": ""}],
+                "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
             }),
         ));
     }
@@ -1220,6 +1344,15 @@ pub fn translate_sync_response(
                 "role": "assistant",
                 "status": "completed",
                 "content": [{"type": "text", "text": content}],
+            }));
+        }
+    }
+    if let Some(reasoning_content) = message.get("reasoning_content").and_then(Value::as_str) {
+        if !reasoning_content.is_empty() {
+            output_items.push(json!({
+                "id": format!("rs_{}", unix_ms()),
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": reasoning_content}],
             }));
         }
     }
@@ -1623,7 +1756,38 @@ mod tests {
             &all,
             b"response.reasoning_summary_text.delta"
         ));
+        assert!(contains_event(&all, b"thinking..."));
         assert!(contains_event(&all, b"response.completed"));
+    }
+
+    #[test]
+    fn reasoning_summary_round_trips_to_chat_reasoning_content() {
+        let codex = json!({
+            "model": "gpt-5",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "must pass back"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "next"}]
+                }
+            ]
+        });
+        let (body, _state) =
+            translate_request(&serde_json::to_vec(&codex).unwrap(), "mimo-v2.5-pro").unwrap();
+        let v = parse(&body);
+        let messages = v["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["reasoning_content"], "must pass back");
+        assert_eq!(messages[0]["content"], "answer");
     }
 
     #[test]
@@ -1676,6 +1840,97 @@ mod tests {
         assert_eq!(tools[0]["type"], "web_search");
         assert_eq!(tools[0]["web_search"]["enable"], true);
         assert_eq!(tools[0]["web_search"]["search_engine"], "search_pro_jina");
+        assert!(v.get("webSearchEnabled").is_none());
+    }
+
+    #[test]
+    fn mimo_web_search_tool_is_dropped() {
+        // MiMo Token Plan accounts without the Web Search Plugin reject any request
+        // that carries a web_search tool, so we strip it before forwarding upstream.
+        let codex = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "function": {"name": "keep_me"}},
+            ],
+        });
+        let (body, _state) =
+            translate_request(&serde_json::to_vec(&codex).unwrap(), "mimo-v2.5-pro").unwrap();
+        let v = parse(&body);
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "web_search must be stripped for MiMo");
+        assert_eq!(tools[0]["function"]["name"], "keep_me");
+        assert!(v.get("webSearchEnabled").is_none());
+    }
+
+    #[test]
+    fn mimo_assistant_history_has_reasoning_content_fallback() {
+        let codex = json!({
+            "model": "gpt-5",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "previous"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "next"}]
+                }
+            ]
+        });
+        let (body, _state) =
+            translate_request(&serde_json::to_vec(&codex).unwrap(), "mimo-v2.5-pro").unwrap();
+        let v = parse(&body);
+        assert_eq!(v["messages"][0]["role"], "assistant");
+        assert_eq!(v["messages"][0]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn mimo_drops_empty_reasoning_tool_call_history() {
+        // MiMo rejects assistant turns with tool_calls but empty reasoning_content
+        // (char-0 JSON parse error). The translator should silently prune those
+        // turns and their following tool result messages from history.
+        let codex = json!({
+            "model": "gpt-5",
+            "input": [
+                // valid assistant turn: has reasoning text → KEEP
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking A"}]},
+                {"type": "function_call", "call_id": "c1", "name": "f1", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "out1"},
+                // bad assistant turn: tool_calls but no reasoning → DROP (and its tool output)
+                {"type": "function_call", "call_id": "c2", "name": "f2", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c2", "output": "out2"},
+                // valid user message → KEEP
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]},
+            ]
+        });
+        let (body, _state) =
+            translate_request(&serde_json::to_vec(&codex).unwrap(), "mimo-v2.5-pro").unwrap();
+        let v = parse(&body);
+        let messages = v["messages"].as_array().unwrap();
+        // Expected after pruning:
+        //   [0] assistant (kept — reasoning_content non-empty, has c1 tool_call)
+        //   [1] tool      (kept — output of c1)
+        //   [2] user      (kept — final user msg)
+        // The c2 turn was dropped because reasoning_content was empty for it,
+        // but it appears the c1 and c2 calls coalesced into one assistant message
+        // during normalization. Verify no tool message for c2 leaks through.
+        let has_c2_tool = messages.iter().any(|m| {
+            m.get("tool_call_id").and_then(Value::as_str) == Some("c2")
+        });
+        assert!(!has_c2_tool, "tool output for dropped c2 must be pruned");
+        // The first assistant message should still carry tool_calls (from c1).
+        let first_assistant = messages
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("expected at least one assistant message");
+        assert_eq!(
+            first_assistant.get("reasoning_content").and_then(Value::as_str),
+            Some("thinking A")
+        );
     }
 
     #[test]

@@ -567,6 +567,11 @@ fn current_relay_route(state: &ProxyState) -> Option<RelayRoute> {
 /// 若 body 是 JSON 且含 `model` 字段，按 `map` / `fallback` 重写。
 ///
 /// 优先级：map 命中 > fallback；都不命中或值跟原值相等 → 原样返回。
+///
+/// **幂等保证**：函数可能在请求生命周期里被调用多次（顶层 raw body 一次 + 解压
+/// 后翻译器入口再一次）。如果当前 model 已经是 map 的某个 value（或正好等于
+/// fallback），就跳过——避免出现"o1→deepseek-reasoner 之后再被 fallback 拉回
+/// deepseek-chat"这种 double-rewrite 把 reasoner 模型偷偷换成 chat 的 bug。
 fn rewrite_model_in_body(
     body: &Bytes,
     map: Option<&std::collections::HashMap<String, String>>,
@@ -583,6 +588,17 @@ fn rewrite_model_in_body(
         Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
+    // 幂等：如果 original 已经是 map 的某个 target value，或就是 fallback，
+    // 说明此前已经 rewrite 过；直接返回，不再二次替换。
+    let already_target = map
+        .map(|m| m.values().any(|v| v == &original))
+        .unwrap_or(false)
+        || fallback.map_or(false, |f| f == original);
+    if already_target {
+        return body.clone();
+    }
+
     let target = map
         .and_then(|m| m.get(&original).cloned())
         .or_else(|| fallback.map(String::from));
@@ -1017,34 +1033,14 @@ async fn handle_request(
 
     // ── WebSocket 升级检测 ──
     if is_websocket_upgrade(&req) {
-        // Relay + chat_completions（GLM 这类）上游只有 HTTP /chat/completions，
-        // 没有 WS 端点。原 handle_websocket 会盲目把 wss://upstream/v1/responses
-        // 桥接出去 → 上游立刻关 → codex.app 看 "websocket closed by server before
-        // response.completed" 重连 5 次才 fallback 到 HTTP。
-        // 这里直接拒绝升级（返回 400），让 codex.app 一次失败后立即走 HTTP 路径。
-        let chat_completions_relay = state
-            .store
-            .lock()
-            .ok()
-            .and_then(|s| {
-                let id = s.current.as_ref()?.clone();
-                let acc = s.accounts.get(&id)?;
-                if acc.is_relay() && acc.relay_protocol.as_deref() == Some("chat_completions") {
-                    Some(())
-                } else {
-                    None
-                }
-            })
-            .is_some();
-        if chat_completions_relay {
-            println!(
-                "[Proxy] WebSocket upgrade 拒绝（chat_completions Relay 上游无 WS）：{}",
-                req.uri()
-            );
-            return Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "chat_completions Relay (GLM) 不支持 WebSocket，请用 HTTP/SSE",
-            ));
+        if let Some(relay) = current_relay_route(&state) {
+            if relay.protocol == "chat_completions" {
+                println!(
+                    "[Proxy] WebSocket upgrade 转入 chat_completions Relay 适配器：{}",
+                    req.uri()
+                );
+                return handle_chat_completions_relay_websocket(state, relay, req).await;
+            }
         }
         println!("[Proxy] WebSocket upgrade 请求: {}", req.uri());
         return handle_websocket(state, req).await;
@@ -1270,12 +1266,29 @@ async fn handle_request(
                         ));
                     }
                 }
-                SilentRefreshOutcome::LoggedOut => {
-                    println!("[Proxy] 刷新失败：账号已登出/RT 被轮换，标记 + 切号");
+                SilentRefreshOutcome::LoggedOut
+                | SilentRefreshOutcome::OtherError(_)
+                | SilentRefreshOutcome::NoRefreshToken => {
+                    let (mark_field, log_tag): (&str, &str) = match &outcome {
+                        SilentRefreshOutcome::LoggedOut => ("logged_out", "账号已登出/RT 被轮换"),
+                        SilentRefreshOutcome::NoRefreshToken => {
+                            ("token_invalid", "缺 refresh_token 无法刷新")
+                        }
+                        SilentRefreshOutcome::OtherError(_) => ("token_invalid", "刷新失败"),
+                        _ => unreachable!(),
+                    };
+                    println!(
+                        "[Proxy] silent_refresh 不可恢复（{}），标记 + 切号",
+                        log_tag
+                    );
                     if let Ok(mut store) = state.store.lock() {
                         if let Some(current_id) = store.current.clone() {
                             if let Some(acc) = store.accounts.get_mut(&current_id) {
-                                acc.is_logged_out = true;
+                                if mark_field == "logged_out" {
+                                    acc.is_logged_out = true;
+                                } else {
+                                    acc.is_token_invalid = true;
+                                }
                                 let _ = store.save();
                             }
                         }
@@ -1293,12 +1306,6 @@ async fn handle_request(
                     {
                         return Ok(resp);
                     }
-                }
-                SilentRefreshOutcome::OtherError(e) => {
-                    println!("[Proxy] 刷新失败 (其他原因): {}", e);
-                }
-                SilentRefreshOutcome::NoRefreshToken => {
-                    println!("[Proxy] 当前账号缺 refresh_token，无法刷新");
                 }
             }
         }
@@ -1828,6 +1835,9 @@ async fn try_switch_and_retry(
     session_key: Option<&str>,
     reason: SwitchReason,
 ) -> Option<Response<ProxyBody>> {
+    // Pre-flight：记录入口时的 current，以便最后兜底恢复
+    let entry_current = state.store.lock().ok().and_then(|s| s.current.clone());
+
     // current 是 Relay 时按设置决定 401/429 是否自动切走
     {
         let store = state.store.lock().ok();
@@ -1926,11 +1936,87 @@ async fn try_switch_and_retry(
                 };
                 eprintln!("[Proxy] {}", msg);
                 let _ = state.app_handle.emit("proxy-all-exhausted", &msg);
+                restore_current_if_flagged(state, entry_current.as_deref());
                 return None;
             }
         }
     }
+    restore_current_if_flagged(state, entry_current.as_deref());
     None
+}
+
+/// `try_switch_and_retry` 的 retry 循环里每次 attempt 都会先 `do_switch` 改
+/// `store.current`，所以失败收尾时 store.current 通常停在最后一个被试过的（已被
+/// 标记为 banned / token_invalid / logged_out 的）坏账号上。下次 proxy 收到请求
+/// 会用这个坏号 → 又 401/429 → 又走 try_switch_and_retry → 死循环。
+///
+/// 这里收尾：如果 `store.current` 是已标记的坏号，尝试把 current 改回入口时的
+/// `entry_id`（如果它还健康），否则随便找一个健康账号顶上。**不发任何请求**，
+/// 纯本地 store 矫正。
+fn restore_current_if_flagged(state: &ProxyState, entry_id: Option<&str>) {
+    let mut store = match state.store.lock() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let current_id = match store.current.clone() {
+        Some(id) => id,
+        None => return,
+    };
+    let current_flagged = store
+        .accounts
+        .get(&current_id)
+        .map(|a| a.is_banned || a.is_token_invalid || a.is_logged_out)
+        .unwrap_or(false);
+    if !current_flagged {
+        return; // current 健康，不动
+    }
+
+    // 先看 entry 那个号还能不能用
+    let entry_ok = entry_id
+        .filter(|eid| *eid != current_id.as_str())
+        .and_then(|eid| store.accounts.get(eid))
+        .map(|a| !a.is_banned && !a.is_token_invalid && !a.is_logged_out)
+        .unwrap_or(false);
+    // 兜底候选：遵守 `relay_auto_switch_in` 约束 —— 默认 false 时不能挑 Relay
+    // 类账号（否则用户手切到订阅号、自动切链失败后会被收尾切到 GLM/MiMo 这种
+    // 中转，违反"非订阅号只能手动切"的预期）。
+    let allow_relay = store.settings.relay_auto_switch_in;
+    let revert_to: Option<String> = if entry_ok {
+        entry_id.map(String::from)
+    } else {
+        store
+            .accounts
+            .iter()
+            .find(|(id, a)| {
+                id.as_str() != current_id.as_str()
+                    && !a.is_banned
+                    && !a.is_token_invalid
+                    && !a.is_logged_out
+                    && (allow_relay || !a.is_relay())
+            })
+            .map(|(id, _)| id.clone())
+    };
+    if let Some(target_id) = revert_to {
+        let target_name = store
+            .accounts
+            .get(&target_id)
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        println!(
+            "[Proxy] 切号链失败收尾：current 是坏号 {}, 矫正回 {}",
+            current_id, target_id
+        );
+        if let Err(e) = store.switch_to(&target_id, true) {
+            eprintln!("[Proxy] 收尾矫正 switch_to 失败: {}", e);
+        } else {
+            let _ = store.save();
+            invalidate_remote_token_cache();
+            let _ = state.app_handle.emit("proxy-account-switched", &target_name);
+            let _ = state.app_handle.emit("accounts-updated", ());
+        }
+    } else {
+        eprintln!("[Proxy] 切号链失败收尾：无健康账号可恢复，current 仍指向坏号");
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -2019,8 +2105,14 @@ async fn forward_to_server_parts(
 
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
-    state
-        .client
+    // Server 永远是 LAN/ZeroTier 私有 IP，必须绕开系统代理（防 Clash 截走）。
+    // state.client 是共享 client、走系统代理用于打 ChatGPT/Relay 上游，这里另起一个。
+    let no_proxy_client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("构建 no_proxy client 失败: {}", e))?;
+    no_proxy_client
         .request(reqwest_method, &upstream_url)
         .headers(fwd_headers)
         .body(body.to_vec())
@@ -2093,7 +2185,15 @@ async fn try_local_fallback(
             None
         }
         BootstrappedForward::Unauthorized => {
-            println!("[Proxy] 本地回退账号 token 失效");
+            // 切到的回退号 token 也失效 → 标 is_token_invalid + save，
+            // 否则下一次 pick_next 又会同分挑到这个号，进入死循环。
+            println!("[Proxy] 本地回退账号 token 失效，标记 is_token_invalid");
+            if let Ok(mut store) = state.store.lock() {
+                if let Some(acc) = store.accounts.get_mut(&id) {
+                    acc.is_token_invalid = true;
+                    let _ = store.save();
+                }
+            }
             None
         }
         BootstrappedForward::Failed(e) => {
@@ -4357,6 +4457,400 @@ fn build_chat_completions_url(base_url: &str) -> Option<(String, String)> {
     Some((format!("{}/chat/completions", trimmed), host))
 }
 
+fn is_mimo_relay_base(base_url: Option<&str>) -> bool {
+    base_url
+        .map(|u| u.to_ascii_lowercase().contains("xiaomimimo.com"))
+        .unwrap_or(false)
+}
+
+/// 把厂商自家 chat_completions 错误体翻译成 codex 能识别的标准 OpenAI 错误。
+///
+/// codex CLI 收到 `/v1/responses` 4xx 时按 OpenAI 错误格式 `{error:{code,message,type}}`
+/// 解析；命中 `context_length_exceeded` 会触发自动 compact、命中 `usage_limit_reached`
+/// 会显示限额提示。各家厂商的 400 错误体格式不一（GLM 1261 / MiMo 自己的 code / DeepSeek
+/// 又是另一套），不归一化的话 codex 解析失败 → "正在思考一下然后退出"。
+///
+/// 命中规则按 message 关键字（按厂商收集到的实际错误文案）；都不命中 → 原样透回。
+fn normalize_chat_completions_error(
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> (reqwest::StatusCode, Bytes) {
+    // 解析失败 / 上游本来就没返回 JSON → 透传
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return (status, Bytes::copy_from_slice(body)),
+    };
+    let msg = v
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let code = v
+        .pointer("/error/code")
+        .and_then(|v| {
+            v.as_str().map(String::from).or_else(|| {
+                v.as_i64().map(|n| n.to_string())
+            })
+        })
+        .unwrap_or_default();
+
+    // 关键字探测（按已知厂商错误文案积累）
+    let is_context_overflow = msg.contains("prompt exceeds max length")    // GLM 1261
+        || msg.contains("maximum context length")                          // OpenAI/DeepSeek
+        || msg.contains("context length")
+        || msg.contains("token limit")
+        || msg.contains("too many tokens")
+        || msg.contains("input too long")
+        || msg.contains("超出")
+        || msg.contains("超过")
+        || code == "1261";
+
+    let is_rate_limit = msg.contains("rate limit")
+        || msg.contains("usage limit")
+        || msg.contains("quota")
+        || msg.contains("rate_limit");
+
+    let normalized: Option<serde_json::Value> = if is_context_overflow {
+        Some(serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+                "message": format!("Upstream rejected request: prompt is too long for this model. (Original: {})",
+                    v.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("context length exceeded")),
+                "param": null,
+            }
+        }))
+    } else if is_rate_limit {
+        Some(serde_json::json!({
+            "error": {
+                "type": "rate_limit_error",
+                "code": "usage_limit_reached",
+                "message": v.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("Rate limit reached").to_string(),
+                "param": null,
+            }
+        }))
+    } else {
+        None
+    };
+
+    match normalized {
+        Some(json) => {
+            let new_status = if is_rate_limit && status.as_u16() != 429 {
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            } else if is_context_overflow {
+                reqwest::StatusCode::BAD_REQUEST
+            } else {
+                status
+            };
+            let bytes = serde_json::to_vec(&json).unwrap_or_default();
+            eprintln!(
+                "[Proxy] 归一化上游错误 {} → {} ({})",
+                status.as_u16(),
+                new_status.as_u16(),
+                if is_context_overflow { "context_length_exceeded" } else { "usage_limit_reached" }
+            );
+            (new_status, Bytes::from(bytes))
+        }
+        None => (status, Bytes::copy_from_slice(body)),
+    }
+}
+
+fn force_mimo_web_search_flag(body: &mut Vec<u8>) {
+    let mut value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let has_web_search = value
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type").and_then(|v| v.as_str()) == Some("web_search")
+                    || tool.get("web_search").is_some()
+            })
+        })
+        .unwrap_or(false);
+    if !has_web_search {
+        return;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("webSearchEnabled".to_string(), serde_json::Value::Bool(true));
+        if let Ok(out) = serde_json::to_vec(&value) {
+            *body = out;
+        }
+    }
+}
+
+async fn handle_chat_completions_relay_websocket(
+    state: Arc<ProxyState>,
+    relay: RelayRoute,
+    mut req: Request<Incoming>,
+) -> Result<Response<ProxyBody>, Infallible> {
+    let ws_key = req
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let accept_key = tungstenite::handshake::derive_accept_key(ws_key.as_bytes());
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    let req_headers = req.headers().clone();
+
+    let response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Accept", accept_key)
+        .body(full_body(Bytes::new()))
+        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "101 构建失败"));
+
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("[Proxy] chat relay WS upgrade 失败: {}", e);
+                return;
+            }
+        };
+        let io = TokioIo::new(upgraded);
+        let mut client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io,
+            tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        println!("[Proxy] chat_completions Relay WS 适配器已连接");
+    { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+        .and_then(|mut f| std::io::Write::write_all(&mut f, b"[ENTRY] WS adapter connected\n")); }
+
+        while let Some(msg) = client_ws.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[Proxy] chat relay WS 读取失败: {}", e);
+                    break;
+                }
+            };
+            match msg {
+                tungstenite::Message::Text(text) => {
+                    if let Err(e) = handle_chat_relay_ws_text(
+                        &state,
+                        &relay,
+                        &req_headers,
+                        text.as_str(),
+                        &mut client_ws,
+                    )
+                    .await
+                    {
+                        let err_evt = serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "proxy_error",
+                                "code": "chat_relay_ws_error",
+                                "message": e,
+                            }
+                        });
+                        let _ = client_ws
+                            .send(tungstenite::Message::Text(err_evt.to_string().into()))
+                            .await;
+                    }
+                }
+                tungstenite::Message::Ping(p) => {
+                    let _ = client_ws.send(tungstenite::Message::Pong(p)).await;
+                }
+                tungstenite::Message::Close(c) => {
+                    let _ = client_ws.send(tungstenite::Message::Close(c)).await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        println!("[Proxy] chat_completions Relay WS 适配器已关闭");
+    });
+
+    Ok(response)
+}
+
+async fn handle_chat_relay_ws_text<S>(
+    state: &Arc<ProxyState>,
+    relay: &RelayRoute,
+    req_headers: &hyper::HeaderMap,
+    text: &str,
+    client_ws: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let event: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("invalid websocket json: {}", e))?;
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if event_type != "response.create" {
+        println!("[Proxy] chat relay WS 忽略客户端事件 type={}", event_type);
+        return Ok(());
+    }
+
+    let mut response_body = event
+        .get("response")
+        .cloned()
+        .ok_or_else(|| "response.create missing response".to_string())?;
+    if let Some(obj) = response_body.as_object_mut() {
+        obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+    }
+
+    let body_bytes = Bytes::from(
+        serde_json::to_vec(&response_body).map_err(|e| format!("serialize response: {}", e))?,
+    );
+    let body_for_translate = rewrite_model_in_body(
+        &body_bytes,
+        relay.model_map.as_ref(),
+        relay.model_fallback.as_deref(),
+    );
+    let model = extract_model_from_body(&body_for_translate);
+    let (mut chat_body, mut translator_state) =
+        crate::relay_translate::translate_request(&body_for_translate, &model)
+            .map_err(|e| format!("translator 请求处理失败: {}", e))?;
+
+    eprintln!("[Proxy] chat relay WS 翻译后 body 前200字符: {}", String::from_utf8_lossy(&chat_body[..chat_body.len().min(200)]));
+
+    let base = relay
+        .base_url
+        .as_deref()
+        .ok_or_else(|| "Relay base_url 未配置".to_string())?;
+    if is_mimo_relay_base(Some(base)) {
+        force_mimo_web_search_flag(&mut chat_body);
+    }
+    let (upstream_url, upstream_host) =
+        build_chat_completions_url(base).ok_or_else(|| "Relay base_url 解析失败".to_string())?;
+
+    let mut headers = build_upstream_headers(req_headers, &upstream_host);
+    let api_key = relay.api_key.clone().unwrap_or_default();
+    if !api_key.is_empty() {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key)) {
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+        }
+    }
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    headers.remove(reqwest::header::CONTENT_LENGTH);
+    headers.remove(reqwest::header::CONTENT_ENCODING);
+
+    println!(
+        "[Proxy] → relay translate (chat_completions WS): {} (model={})",
+        upstream_url, translator_state.model
+    );
+    // DEBUG: dump request to log file
+    {
+        let debug_line = format!("[WS] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
+            upstream_url, translator_state.model, chat_body.len(),
+            String::from_utf8_lossy(&chat_body).contains("webSearchEnabled"));
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| std::io::Write::write_all(&mut f, debug_line.as_bytes()));
+        // Dump first 500 chars of body
+        let preview = String::from_utf8_lossy(&chat_body[..chat_body.len().min(500)]);
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("  body_preview: {}\n\n", preview).as_bytes()));
+    }
+    let upstream_resp = state
+        .client
+        .post(&upstream_url)
+        .headers(headers)
+        .body(chat_body)
+        .send()
+        .await
+        .map_err(|e| format!("relay 上游连接失败: {}", e))?;
+
+    let status = upstream_resp.status();
+    if status != reqwest::StatusCode::OK {
+        let bytes = upstream_resp.bytes().await.unwrap_or_default();
+        let preview: String = String::from_utf8_lossy(&bytes).chars().take(512).collect();
+        return Err(format!("relay 上游 {}: {}", status.as_u16(), preview));
+    }
+
+    send_sse_events_as_ws_json(
+        client_ws,
+        crate::relay_translate::emit_created(&translator_state),
+    )
+    .await?;
+
+    if !is_sse_response(&upstream_resp) {
+        let bytes = upstream_resp.bytes().await.unwrap_or_default();
+        let out = crate::relay_translate::translate_sync_response(&translator_state, &bytes)
+            .map_err(|e| format!("sync 响应翻译失败: {}", e))?;
+        let response_obj: serde_json::Value =
+            serde_json::from_slice(&out).map_err(|e| format!("sync json parse: {}", e))?;
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": response_obj,
+        });
+        client_ws
+            .send(tungstenite::Message::Text(completed.to_string().into()))
+            .await
+            .map_err(|e| format!("websocket send failed: {}", e))?;
+        return Ok(());
+    }
+
+    let mut upstream_stream = upstream_resp.bytes_stream();
+    let mut buf = crate::relay_translate::ChatSseBuffer::new();
+    let mut saw_done = false;
+    while !saw_done {
+        match upstream_stream.next().await {
+            Some(Ok(chunk)) => {
+                buf.push(&chunk);
+                for e in buf.drain_events() {
+                    match e {
+                        crate::relay_translate::ChatSseEvent::Done => {
+                            saw_done = true;
+                            break;
+                        }
+                        crate::relay_translate::ChatSseEvent::Data(payload) => {
+                            for translated in
+                                crate::relay_translate::handle_chunk(&mut translator_state, &payload)
+                            {
+                                send_sse_events_as_ws_json(client_ws, translated).await?;
+                            }
+                        }
+                    }
+                }
+            }
+            Some(Err(e)) => return Err(format!("relay SSE 上游错误: {}", e)),
+            None => break,
+        }
+    }
+    send_sse_events_as_ws_json(
+        client_ws,
+        crate::relay_translate::emit_completed(&mut translator_state),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn send_sse_events_as_ws_json<S>(
+    client_ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    bytes: Vec<u8>,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let text = String::from_utf8_lossy(&bytes);
+    for block in text.split("\n\n") {
+        for line in block.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                client_ws
+                    .send(tungstenite::Message::Text(data.to_string().into()))
+                    .await
+                    .map_err(|e| format!("websocket send failed: {}", e))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_chat_completions_relay(
     state: Arc<ProxyState>,
     relay: RelayRoute,
@@ -4420,6 +4914,9 @@ async fn handle_chat_completions_relay(
         }
     }
 
+    // DEBUG: log HTTP relay entry
+    { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+        .and_then(|mut f| std::io::Write::write_all(&mut f, format!("[HTTP-ENTRY] path={} body_len={}\n", path_and_query, body_bytes.len()).as_bytes())); }
     // 翻译请求体
     if body_bytes.is_empty() {
         eprintln!(
@@ -4491,7 +4988,7 @@ async fn handle_chat_completions_relay(
         relay.model_fallback.as_deref(),
     );
     let model = extract_model_from_body(&body_for_translate);
-    let (chat_body, mut translator_state) =
+    let (mut chat_body, mut translator_state) =
         match crate::relay_translate::translate_request(&body_for_translate, &model) {
             Ok(x) => x,
             Err(e) => {
@@ -4517,6 +5014,9 @@ async fn handle_chat_completions_relay(
         Some(x) => x,
         None => return error_response(StatusCode::BAD_GATEWAY, "Relay base_url 解析失败"),
     };
+    if is_mimo_relay_base(Some(base)) {
+        force_mimo_web_search_flag(&mut chat_body);
+    }
 
     // 透传必要 header（剔除 Authorization/Host），强制注入 Relay api_key
     let mut headers = build_upstream_headers(&req_headers, &upstream_host);
@@ -4540,6 +5040,17 @@ async fn handle_chat_completions_relay(
         "[Proxy] → relay translate (chat_completions): {} {} (model={}, stream={})",
         method, upstream_url, translator_state.model, translator_state.stream_requested
     );
+    // DEBUG: dump HTTP request to log file
+    {
+        let debug_line = format!("[HTTP] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
+            upstream_url, translator_state.model, body_bytes_chat.len(),
+            String::from_utf8_lossy(&body_bytes_chat).contains("webSearchEnabled"));
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| std::io::Write::write_all(&mut f, debug_line.as_bytes()));
+        let preview = String::from_utf8_lossy(&body_bytes_chat[..body_bytes_chat.len().min(500)]);
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("  body_preview: {}\n\n", preview).as_bytes()));
+    }
 
     let upstream_resp = match state
         .client
@@ -4564,7 +5075,6 @@ async fn handle_chat_completions_relay(
 
     let status = upstream_resp.status();
     if status != reqwest::StatusCode::OK {
-        // 错误体直接透回去（codex CLI 看到上游错误更易排错）
         let bytes = upstream_resp.bytes().await.unwrap_or_default();
         let preview: String = String::from_utf8_lossy(&bytes).chars().take(512).collect();
         eprintln!(
@@ -4573,10 +5083,14 @@ async fn handle_chat_completions_relay(
             upstream_url,
             preview
         );
+        // 归一化：把厂商自家的 400 错误体翻译成 codex 能识别的 OpenAI 标准格式。
+        // 否则 codex 解析失败会"思考一下然后退出"（GLM 1261 / DeepSeek too_long_input
+        // / MiMo 自有错误码 都不是 OpenAI 格式 → codex 不认）。
+        let (status_out, body_out) = normalize_chat_completions_error(status, &bytes);
         return Response::builder()
-            .status(status.as_u16())
+            .status(status_out.as_u16())
             .header("content-type", "application/json")
-            .body(full_body(bytes))
+            .body(full_body(body_out))
             .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "上游响应构建失败"));
     }
 
