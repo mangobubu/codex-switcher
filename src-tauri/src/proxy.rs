@@ -1209,6 +1209,17 @@ async fn handle_request(
         || status_code == reqwest::StatusCode::FORBIDDEN
         || status_code == reqwest::StatusCode::PAYMENT_REQUIRED
     {
+        // 记下触发错误的账号名（在 silent_refresh / 切号污染 store.current 之前）
+        let triggering_account_name: String = state
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| {
+                let id = s.current.clone()?;
+                s.accounts.get(&id).map(|a| a.name.clone())
+            })
+            .unwrap_or_else(|| "未知".to_string());
+
         let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
         let body_lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
         let body_hits_banned = body_lower.contains("deactivated")
@@ -1345,10 +1356,36 @@ async fn handle_request(
             }
         }
 
+        // 所有切号尝试都失败 / 账号池耗尽。
+        // **不要把上游原始 401 body 透回 codex**（典型文案：
+        //   "Your access token could not be refreshed because you have since
+        //    logged out or signed in to another account."），用户看了一头雾水、
+        //   不知道是哪个号、也不知道是切号链失败还是 codex 自己出问题。
+        // 改成清楚的中文+英文错误，包含触发账号名，方便对照排查。
+        let friendly = serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "all_accounts_exhausted",
+                "message": format!(
+                    "[Codex Switcher] 触发账号「{}」失效或限额，自动切号链已经试过所有可用号都失败 / 已耗尽。请打开 Codex Switcher 检查账号面板：刷新配额、重新登录失效的号、或者手动切到健康的订阅号。原上游响应已存日志。 / Triggering account \"{}\" failed; auto-switch chain exhausted all candidates.",
+                    triggering_account_name, triggering_account_name
+                ),
+                "param": null,
+            }
+        });
+        let body_bytes = serde_json::to_vec(&friendly).unwrap_or(resp_bytes.to_vec());
+        eprintln!(
+            "[Proxy] 401/403 链路完全失败，原始上游 body 前 200 字符: {}",
+            String::from_utf8_lossy(&resp_bytes).chars().take(200).collect::<String>()
+        );
+        let _ = state.app_handle.emit(
+            "proxy-account-failed",
+            &format!("账号「{}」401/限额耗尽，切号链失败", triggering_account_name),
+        );
         return Ok(Response::builder()
             .status(status_code.as_u16())
             .header("content-type", "application/json")
-            .body(full_body(resp_bytes))
+            .body(full_body(Bytes::from(body_bytes)))
             .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "响应构建失败")));
     }
 
