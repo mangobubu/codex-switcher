@@ -1240,7 +1240,42 @@ async fn handle_request(
                 return Ok(resp);
             }
         } else {
-            // 401 且未封号，可能是正常过期或被登出。
+            // current 是 Relay 时跳过 silent_refresh —— Relay 账号用静态 API Key，
+            // 没有 refresh_token 也不会被轮换/过期。401 几乎只可能是上游 hiccup 或
+            // key 被用户手动 revoke。silent_refresh 跑下来必返 NoRefreshToken，
+            // 旧逻辑会把账号永久标 is_token_invalid → UI 显示"过期" → 用户困惑。
+            let current_is_relay = state
+                .store
+                .lock()
+                .ok()
+                .and_then(|s| {
+                    let id = s.current.clone()?;
+                    s.accounts.get(&id).map(|a| a.is_relay())
+                })
+                .unwrap_or(false);
+            if current_is_relay {
+                println!("[Proxy] 拦截到 401（Relay 账号），跳过 silent_refresh 直接试切号");
+                if let Some(resp) = try_switch_and_retry(
+                    &state,
+                    &method,
+                    &upstream_url,
+                    &base_headers,
+                    &body_bytes,
+                    session_key.as_deref(),
+                    SwitchReason::Http429,
+                )
+                .await
+                {
+                    return Ok(resp);
+                }
+                // 切号无果 → 把原 401 body 透回（用户能看到上游的真实错误信息）
+                return Ok(Response::builder()
+                    .status(status_code.as_u16())
+                    .header("content-type", "application/json")
+                    .body(full_body(resp_bytes))
+                    .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "响应构建失败")));
+            }
+            // 非 Relay：401 可能是正常过期或被登出。
             // 按设计：client / solo 模式下 Server 是 RT 轮换的唯一权威，本机不独自 refresh
             // —— 优先问 Server 拿 fresh token，避免和 Server 撞轮换；Server 不可达再降级本地。
             // off / server 模式下本地直接 refresh。

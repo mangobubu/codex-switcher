@@ -1815,15 +1815,21 @@ pub fn start_quota_refresh(
                                     let mut pruned = 0usize;
                                     if let Ok(mut s) = store.lock() {
                                         // 1) 同步 quota/封禁/失效状态
+                                        //    Relay 账号的 is_token_invalid / is_logged_out 不
+                                        //    跟 Server 同步——Relay 用静态 API Key，本地是权威；
+                                        //    Server 上的 stale flag（比如旧版本误标过的）不应
+                                        //    污染本地。is_banned 也同样跳过（Relay 没有"封号"概念）。
                                         for e in &entries {
                                             if let Some(acc) = s.accounts.get_mut(&e.id) {
                                                 if let Some(q) = e.cached_quota.clone() {
                                                     acc.cached_quota = Some(q);
                                                     updated += 1;
                                                 }
-                                                acc.is_banned = e.is_banned;
-                                                acc.is_token_invalid = e.is_token_invalid;
-                                                acc.is_logged_out = e.is_logged_out;
+                                                if !acc.is_relay() {
+                                                    acc.is_banned = e.is_banned;
+                                                    acc.is_token_invalid = e.is_token_invalid;
+                                                    acc.is_logged_out = e.is_logged_out;
+                                                }
                                             }
                                         }
                                         // 2) 删除 Server 上已不存在的账号（多端删号同步）

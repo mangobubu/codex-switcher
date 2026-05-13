@@ -602,8 +602,32 @@ impl AccountStore {
         if store.migrate_relay_category() {
             let _ = store.save();
         }
+        if store.migrate_clear_relay_token_invalid() {
+            let _ = store.save();
+        }
 
         store
+    }
+
+    /// 一次性迁移：清掉所有 Relay 账号的 `is_token_invalid` 标记。
+    /// 0.5.29 之前的版本有 bug：proxy.rs 在 Relay 上游返回 401 时也会跑
+    /// `silent_refresh`，但 Relay 用静态 API Key 没有 refresh_token →
+    /// `SilentRefreshOutcome::NoRefreshToken` → 误标 `is_token_invalid` →
+    /// UI 显示"过期"，永远不会被自动清掉。
+    /// 0.5.30 修了 proxy.rs 跳过 Relay 的 silent_refresh，这里把历史误标清掉。
+    fn migrate_clear_relay_token_invalid(&mut self) -> bool {
+        let mut changed = false;
+        for acc in self.accounts.values_mut() {
+            if matches!(acc.kind, AccountKind::Relay) && acc.is_token_invalid {
+                acc.is_token_invalid = false;
+                changed = true;
+                println!(
+                    "[Migration] Relay 账号 {} 清除误标的 is_token_invalid",
+                    acc.name
+                );
+            }
+        }
+        changed
     }
 
     /// 一次性迁移：给老的 Relay 账号填上 `relay_category`。
