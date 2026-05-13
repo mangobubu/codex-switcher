@@ -446,7 +446,24 @@ async fn resolve_token_with_affinity(
             store
                 .accounts
                 .get(id)
-                .map(|a| !a.is_banned && !a.is_logged_out && !a.is_token_invalid)
+                .map(|a| {
+                    // 基础健康：没被打三个 flag
+                    let basic_ok = !a.is_banned && !a.is_logged_out && !a.is_token_invalid;
+                    if !basic_ok {
+                        return false;
+                    }
+                    // Relay 没有 5h/周配额概念，跳过额度检查
+                    if a.is_relay() {
+                        return true;
+                    }
+                    // 5h / 周配额耗尽时也认为不健康 —— 否则 ChatGPT 上游会做
+                    // 静默 mid-stream RST（不是干净 429），codex 看到 transport error
+                    // 反复重连 5/5 仍失败。把这种"软失效"也从 affinity 候选剔除。
+                    match a.cached_quota.as_ref() {
+                        Some(q) => q.five_hour_left > 0.0 && q.weekly_left > 0.0,
+                        None => true, // 没缓存就给个 benefit of doubt
+                    }
+                })
                 .unwrap_or(false)
         });
         match bid {
