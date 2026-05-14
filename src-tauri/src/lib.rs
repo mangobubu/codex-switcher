@@ -11,6 +11,7 @@ pub mod mailbox;
 pub mod oauth;
 mod oauth_server;
 pub mod otp_login;
+mod provider_quirks;
 mod proxy;
 mod quota_snapshot;
 mod refresh_lock;

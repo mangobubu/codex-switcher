@@ -4803,12 +4803,6 @@ fn build_chat_completions_url(base_url: &str) -> Option<(String, String)> {
     Some((format!("{}/chat/completions", trimmed), host))
 }
 
-fn is_mimo_relay_base(base_url: Option<&str>) -> bool {
-    base_url
-        .map(|u| u.to_ascii_lowercase().contains("xiaomimimo.com"))
-        .unwrap_or(false)
-}
-
 /// 把厂商自家 chat_completions 错误体翻译成 codex 能识别的标准 OpenAI 错误。
 ///
 /// codex CLI 收到 `/v1/responses` 4xx 时按 OpenAI 错误格式 `{error:{code,message,type}}`
@@ -4817,9 +4811,12 @@ fn is_mimo_relay_base(base_url: Option<&str>) -> bool {
 /// 又是另一套），不归一化的话 codex 解析失败 → "正在思考一下然后退出"。
 ///
 /// 命中规则按 message 关键字（按厂商收集到的实际错误文案）；都不命中 → 原样透回。
+/// 如果传入 `provider`（chat_completions 路径都能 detect_provider 拿到），会进一步从
+/// `provider_quirks::enhance_error_hint` 取一条用户向操作提示，追加到 message 末尾。
 fn normalize_chat_completions_error(
     status: reqwest::StatusCode,
     body: &[u8],
+    provider: crate::provider_quirks::RelayProvider,
 ) -> (reqwest::StatusCode, Bytes) {
     // 解析失败 / 上游本来就没返回 JSON → 透传
     let v: serde_json::Value = match serde_json::from_slice(body) {
@@ -4839,6 +4836,7 @@ fn normalize_chat_completions_error(
             })
         })
         .unwrap_or_default();
+    let hint = crate::provider_quirks::enhance_error_hint(provider, &msg);
 
     // 关键字探测（按已知厂商错误文案积累）
     let is_context_overflow = msg.contains("prompt exceeds max length")    // GLM 1261
@@ -4856,13 +4854,25 @@ fn normalize_chat_completions_error(
         || msg.contains("quota")
         || msg.contains("rate_limit");
 
+    let with_hint = |base: &str| -> String {
+        match hint {
+            Some(h) => format!("{} {}", base, h),
+            None => base.to_string(),
+        }
+    };
+    let original_msg = v
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
     let normalized: Option<serde_json::Value> = if is_context_overflow {
         Some(serde_json::json!({
             "error": {
                 "type": "invalid_request_error",
                 "code": "context_length_exceeded",
-                "message": format!("Upstream rejected request: prompt is too long for this model. (Original: {})",
-                    v.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("context length exceeded")),
+                "message": with_hint(&format!("Upstream rejected request: prompt is too long for this model. (Original: {})",
+                    if original_msg.is_empty() { "context length exceeded".to_string() } else { original_msg.clone() })),
                 "param": null,
             }
         }))
@@ -4871,10 +4881,20 @@ fn normalize_chat_completions_error(
             "error": {
                 "type": "rate_limit_error",
                 "code": "usage_limit_reached",
-                "message": v.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("Rate limit reached").to_string(),
+                "message": with_hint(if original_msg.is_empty() { "Rate limit reached" } else { &original_msg }),
                 "param": null,
             }
         }))
+    } else if hint.is_some() {
+        // 没命中 context_overflow / rate_limit，但 provider hint 命中（比如 MiMo
+        // webSearchEnabled 这种）：保留原 error type，把 hint 追加到 message。
+        let original_obj = v
+            .get("error")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut error_obj = original_obj.as_object().cloned().unwrap_or_default();
+        error_obj.insert("message".to_string(), serde_json::Value::String(with_hint(&original_msg)));
+        Some(serde_json::json!({"error": error_obj}))
     } else {
         None
     };
@@ -4889,41 +4909,23 @@ fn normalize_chat_completions_error(
                 status
             };
             let bytes = serde_json::to_vec(&json).unwrap_or_default();
+            let reason = if is_context_overflow {
+                "context_length_exceeded"
+            } else if is_rate_limit {
+                "usage_limit_reached"
+            } else {
+                "provider_hint_added"
+            };
             eprintln!(
-                "[Proxy] 归一化上游错误 {} → {} ({})",
+                "[Proxy] 归一化上游错误 {} → {} ({}{})",
                 status.as_u16(),
                 new_status.as_u16(),
-                if is_context_overflow { "context_length_exceeded" } else { "usage_limit_reached" }
+                reason,
+                if hint.is_some() { ", with provider hint" } else { "" }
             );
             (new_status, Bytes::from(bytes))
         }
         None => (status, Bytes::copy_from_slice(body)),
-    }
-}
-
-fn force_mimo_web_search_flag(body: &mut Vec<u8>) {
-    let mut value: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let has_web_search = value
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .map(|tools| {
-            tools.iter().any(|tool| {
-                tool.get("type").and_then(|v| v.as_str()) == Some("web_search")
-                    || tool.get("web_search").is_some()
-            })
-        })
-        .unwrap_or(false);
-    if !has_web_search {
-        return;
-    }
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("webSearchEnabled".to_string(), serde_json::Value::Bool(true));
-        if let Ok(out) = serde_json::to_vec(&value) {
-            *body = out;
-        }
     }
 }
 
@@ -5097,9 +5099,10 @@ where
         .base_url
         .as_deref()
         .ok_or_else(|| "Relay base_url 未配置".to_string())?;
-    if is_mimo_relay_base(Some(base)) {
-        force_mimo_web_search_flag(&mut chat_body);
-    }
+    crate::provider_quirks::preprocess_chat_body(
+        crate::provider_quirks::detect_provider(Some(base)),
+        &mut chat_body,
+    );
     let (upstream_url, upstream_host) =
         build_chat_completions_url(base).ok_or_else(|| "Relay base_url 解析失败".to_string())?;
 
@@ -5395,9 +5398,10 @@ async fn handle_chat_completions_relay(
         Some(x) => x,
         None => return error_response(StatusCode::BAD_GATEWAY, "Relay base_url 解析失败"),
     };
-    if is_mimo_relay_base(Some(base)) {
-        force_mimo_web_search_flag(&mut chat_body);
-    }
+    crate::provider_quirks::preprocess_chat_body(
+        crate::provider_quirks::detect_provider(Some(base)),
+        &mut chat_body,
+    );
 
     // chat_completions 专用：tight whitelist，不带 codex 私有 header（GLM 等 WAF
     // 看到 codex 私有 header 会 405），强制注入 Relay api_key
@@ -5468,7 +5472,8 @@ async fn handle_chat_completions_relay(
         // 归一化：把厂商自家的 400 错误体翻译成 codex 能识别的 OpenAI 标准格式。
         // 否则 codex 解析失败会"思考一下然后退出"（GLM 1261 / DeepSeek too_long_input
         // / MiMo 自有错误码 都不是 OpenAI 格式 → codex 不认）。
-        let (status_out, body_out) = normalize_chat_completions_error(status, &bytes);
+        let provider = crate::provider_quirks::detect_provider(relay.base_url.as_deref());
+        let (status_out, body_out) = normalize_chat_completions_error(status, &bytes, provider);
         return Response::builder()
             .status(status_out.as_u16())
             .header("content-type", "application/json")

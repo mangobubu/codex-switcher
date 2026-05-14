@@ -379,6 +379,15 @@ fn process_reasoning_item(item: &Value, messages: &mut Vec<Value>) {
             content.push_str(s);
         }
     }
+    // encrypted_content：流式 emit 时塞的完整 reasoning round-trip 回这里。
+    // 是 MiMo thinking 模式"必须回传 reasoning_content"强校验的真正解 ——
+    // codex 不会 mutate 这个字段，所以重新 pop 出来填到 chat messages 的
+    // reasoning_content 上，多轮无损。
+    if content.is_empty() {
+        if let Some(s) = item.get("encrypted_content").and_then(Value::as_str) {
+            content.push_str(s);
+        }
+    }
     if content.is_empty() {
         return;
     }
@@ -657,119 +666,21 @@ fn transform_payload(payload: &mut Value, model_after_rewrite: &str) {
         }
     }
 
-    // MiMo-only: drop any assistant message with tool_calls but empty
-    // reasoning_content (and the tool result messages that follow it).
-    // MiMo's thinking-mode strict check rejects a multi-turn history that
-    // contains assistant turns missing reasoning_content with the cryptic
-    // 400 "unexpected character: line 1 column 1 (char 0)" error. Codex CLI
-    // 0.130+ keeps reasoning in `encrypted_content` and doesn't surface
-    // plaintext reasoning back into `/v1/responses`, so most historical
-    // assistant turns arrive here with empty reasoning_content.
-    //
-    // Short-term workaround: silently drop those incomplete turns. We lose
-    // tool-call history but the conversation can continue. The long-term
-    // fix is to round-trip MiMo's reasoning through codex's encrypted_content
-    // (see memory: mimo_reasoning_content_strict).
-    if is_mimo {
-        if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
-            let original = std::mem::take(messages);
-            let mut kept: Vec<Value> = Vec::with_capacity(original.len());
-            let mut iter = original.into_iter().peekable();
-            let mut dropped_assistant = 0u32;
-            let mut dropped_tool = 0u32;
-            while let Some(msg) = iter.next() {
-                let drop_this = msg
-                    .as_object()
-                    .map(|mo| {
-                        let is_assistant =
-                            mo.get("role").and_then(Value::as_str) == Some("assistant");
-                        let has_tool_calls = mo
-                            .get("tool_calls")
-                            .and_then(Value::as_array)
-                            .map(|a| !a.is_empty())
-                            .unwrap_or(false);
-                        let rc_empty = mo
-                            .get("reasoning_content")
-                            .and_then(Value::as_str)
-                            .map(|s| s.is_empty())
-                            .unwrap_or(true);
-                        is_assistant && has_tool_calls && rc_empty
-                    })
-                    .unwrap_or(false);
-                if !drop_this {
-                    kept.push(msg);
-                    continue;
-                }
-                dropped_assistant += 1;
-                while let Some(next) = iter.peek() {
-                    if next.get("role").and_then(Value::as_str) == Some("tool") {
-                        iter.next();
-                        dropped_tool += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            if dropped_assistant > 0 || dropped_tool > 0 {
-                eprintln!(
-                    "[relay_translate] MiMo: dropped {} empty-reasoning assistant + {} tool follow-ups from history",
-                    dropped_assistant, dropped_tool
-                );
-            }
-            *messages = kept;
-        }
-    }
+    // 旧版本曾在这里做 "MiMo 历史修剪 workaround"：drop 掉所有 reasoning_content=""
+    // 的 assistant + 后续 tool 消息，绕过 MiMo thinking 模式 "char-0 / must be
+    // passed back" 强校验。现在 encrypted_content round-trip 是真正解 —— emit
+    // 的 reasoning item 带完整 reasoning，codex 下一轮回传时 process_reasoning_item
+    // 从 encrypted_content 读出来填回 chat messages 的 reasoning_content，多轮
+    // 无损，不再需要丢历史。
 
-    // Transform tools: drop strict on function; reshape web_search.
+    // Transform tools: recurse into `namespace`, normalize `local_shell` /
+    // `custom` into plain `function`, reshape `web_search` for GLM, drop
+    // server-side-only types (image_generation / code_interpreter / 等).
     if let Some(tools) = obj.get_mut("tools") {
         if let Some(arr) = tools.as_array_mut() {
             let mut transformed: Vec<Value> = Vec::with_capacity(arr.len());
             for tool in arr.drain(..) {
-                let ttype = tool.get("type").and_then(Value::as_str).map(String::from);
-                match ttype.as_deref() {
-                    Some("function") => {
-                        let mut t = tool;
-                        if let Some(o) = t.as_object_mut() {
-                            o.remove("strict");
-                        }
-                        transformed.push(t);
-                    }
-                    Some("web_search") => {
-                        // `web_search` is a codex CLI native tool, but every upstream
-                        // exposes its own (incompatible) builtin shape — there is no
-                        // generic OpenAI-Chat equivalent. Only GLM's `search_pro_jina`
-                        // builtin is wired up here; MiMo's needs a separately-billed
-                        // plugin (see docs/integration/mimo). Drop it for everyone
-                        // else — codex CLI falls back to shell/other tools.
-                        if is_glm {
-                            transformed.push(json!({
-                                "type": "web_search",
-                                "web_search": {
-                                    "enable": true,
-                                    "search_engine": "search_pro_jina",
-                                }
-                            }));
-                        } else {
-                            eprintln!(
-                                "[relay_translate] dropping web_search tool (no native shape for model={})",
-                                model_after_rewrite
-                            );
-                        }
-                    }
-                    other => {
-                        // codex CLI sends private tool types (local_shell, apply_patch,
-                        // custom_tool, etc.) that GLM rejects with "type is illegal".
-                        // Match the Python reference (zai_provider.py) and silently
-                        // drop them — codex CLI also exposes a regular `function`-typed
-                        // `shell` tool that GLM can call, then we remap the call_id back
-                        // to local_shell_call shape in the response stream.
-                        eprintln!(
-                            "[relay_translate] drop non-GLM tool type={:?} name={:?}",
-                            other,
-                            tool.get("name").or_else(|| tool.pointer("/function/name")),
-                        );
-                    }
-                }
+                transform_tool(tool, is_glm, model_after_rewrite, &mut transformed);
             }
             *arr = transformed;
         }
@@ -787,6 +698,164 @@ fn is_mimo_model(model: &str) -> bool {
 
 fn is_glm_model(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("glm-")
+}
+
+/// Server-side-only 工具：只有 OpenAI/Azure 自家能跑，第三方 chat_completions
+/// 上游一律拒收（多数返 400 "type is illegal"），我们这里直接 drop。
+fn is_server_side_only_tool(t: &str) -> bool {
+    matches!(
+        t,
+        "code_interpreter"
+            | "file_search"
+            | "image_generation"
+            | "computer_use_preview"
+            | "computer_use"
+    )
+}
+
+/// Codex 的 `local_shell` builtin 映射成普通 function tool。
+/// codex 客户端能识别 `shell` 和 `local_shell_call` 两种工具名 callid，
+/// 所以发回去 `shell` function 的 tool_calls 后再由 emit_completed 把
+/// type 改成 local_shell_call 即可。
+fn local_shell_as_function() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "shell",
+            "description": "Execute a shell command on the local machine. Returns stdout, stderr, and exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Argv array; first element is the program, rest are arguments."
+                    },
+                    "workdir": {"type": "string", "description": "Working directory (optional)."},
+                    "timeout_ms": {"type": "number", "description": "Timeout in ms (optional, default 30000)."}
+                },
+                "required": ["command"]
+            }
+        }
+    })
+}
+
+/// 把一个 codex Responses 工具描述翻译成 chat_completions tools 数组的若干条目，
+/// push 到 `out`。返回多条（namespace 展开）/ 一条（普通）/ 零条（dropped）。
+///
+/// 已覆盖的工具类型：
+///   - `function`     —— 原样透传（移除 `strict`，chat 协议没这字段）
+///   - `local_shell`  —— 映射成 `shell` function tool
+///   - `custom`       —— 映射成 freeform `input` 参数的 function（grammar 校验丢失但
+///                       模型仍然能调用）
+///   - `namespace`    —— 递归展开内部 tools（MCP / 分组工具的 wrapper）
+///   - `web_search`   —— 只在 GLM 时映射到 search_pro_jina；其他 drop
+///   - 其它 server-side-only —— drop
+fn transform_tool(tool: Value, is_glm: bool, model: &str, out: &mut Vec<Value>) {
+    let ttype = tool
+        .get("type")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .unwrap_or_default();
+    match ttype.as_str() {
+        "function" => {
+            let mut t = tool;
+            if let Some(o) = t.as_object_mut() {
+                o.remove("strict");
+            }
+            out.push(t);
+        }
+        "local_shell" => {
+            out.push(local_shell_as_function());
+        }
+        "custom" => {
+            // codex / OpenAI 的 freeform "custom" tool（带 grammar 等）。
+            // chat_completions 上游没法约束 grammar，转成 input: string 参数的
+            // 普通 function 让模型能调用就行；描述里追加原 format 提示。
+            let name = tool.get("name").and_then(Value::as_str).map(String::from);
+            let Some(name) = name else {
+                eprintln!("[relay_translate] drop custom tool without name");
+                return;
+            };
+            let format_type = tool
+                .pointer("/format/type")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let desc_base = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let description = match format_type {
+                Some(ft) => format!(
+                    "{}{}(originally a \"{}\"-format custom tool; output should follow that format).",
+                    desc_base,
+                    if desc_base.is_empty() { "" } else { " " },
+                    ft
+                ),
+                None => desc_base.to_string(),
+            };
+            out.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "input": {"type": "string", "description": "Input text for the tool."}
+                        },
+                        "additionalProperties": true,
+                    }
+                }
+            }));
+        }
+        "namespace" => {
+            // MCP / 分组工具 wrapper：{ type: "namespace", name?, tools: [...] }
+            let nested = tool.get("tools").and_then(Value::as_array).cloned();
+            match nested {
+                Some(arr) if !arr.is_empty() => {
+                    for inner in arr {
+                        transform_tool(inner, is_glm, model, out);
+                    }
+                }
+                _ => {
+                    let nsname = tool.get("name").and_then(Value::as_str).unwrap_or("(unnamed)");
+                    eprintln!("[relay_translate] drop empty namespace tool {:?}", nsname);
+                }
+            }
+        }
+        "web_search" | "web_search_preview" => {
+            // 只 GLM 有 search_pro_jina 这个 chat-side 工具名；MiMo 用插件、
+            // 其他三方多数没有 web search 对等品，让 codex 退到 shell 替代。
+            if is_glm {
+                out.push(json!({
+                    "type": "web_search",
+                    "web_search": {
+                        "enable": true,
+                        "search_engine": "search_pro_jina",
+                    }
+                }));
+            } else {
+                eprintln!(
+                    "[relay_translate] dropping web_search tool (no native shape for model={})",
+                    model
+                );
+            }
+        }
+        other if is_server_side_only_tool(other) => {
+            eprintln!(
+                "[relay_translate] drop server-side-only tool type={:?} (no chat_completions equivalent)",
+                other
+            );
+        }
+        other => {
+            eprintln!(
+                "[relay_translate] drop unknown tool type={:?} name={:?}",
+                other,
+                tool.get("name").or_else(|| tool.pointer("/function/name")),
+            );
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1111,12 +1180,18 @@ pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
             .reasoning_item_id
             .clone()
             .unwrap_or_else(|| format!("rs_{}", unix_ms()));
+        // encrypted_content：把完整 reasoning 塞到 codex 会原样保留并下轮回传
+        // 的这个字段里。codex 在下一轮把整段历史送回我们 input 时，reasoning item
+        // 仍然带着 encrypted_content；process_reasoning_item 从中读出来填回
+        // chat messages 的 reasoning_content 字段 —— MiMo 的"必须回传
+        // reasoning_content"强校验直接通过，不再需要丢历史 workaround。
         closing.push((
             idx,
             json!({
                 "id": item_id,
                 "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
+                "encrypted_content": state.full_reasoning_content.clone(),
             }),
         ));
     }
@@ -1213,12 +1288,15 @@ fn collect_final_output(state: &TranslatorState) -> Value {
             .reasoning_item_id
             .clone()
             .unwrap_or_else(|| format!("rs_{}", unix_ms()));
+        // collect_final_output 进的是 response.completed.response.output；
+        // 与 emit_completed 的 response.output_item.done 一致，都带 encrypted_content。
         closing.push((
             idx,
             json!({
                 "id": item_id,
                 "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
+                "encrypted_content": state.full_reasoning_content.clone(),
             }),
         ));
     }
@@ -1893,21 +1971,21 @@ mod tests {
     }
 
     #[test]
-    fn mimo_drops_empty_reasoning_tool_call_history() {
-        // MiMo rejects assistant turns with tool_calls but empty reasoning_content
-        // (char-0 JSON parse error). The translator should silently prune those
-        // turns and their following tool result messages from history.
+    fn mimo_keeps_full_history_with_encrypted_content_roundtrip() {
+        // 旧版 workaround：MiMo 路径下，没有 reasoning_content 的 assistant 轮 +
+        // 后续 tool 消息会被 drop（防 char-0 / must-be-passed-back 强校验报错）。
+        // 现在用 encrypted_content round-trip 解决，**完整历史保留**：
+        // 第二轮 codex 会把上轮 reasoning item 带 encrypted_content 字段发回来，
+        // process_reasoning_item 从 encrypted_content 读出来填到 chat message 的
+        // reasoning_content，校验通过、历史不丢。
         let codex = json!({
             "model": "gpt-5",
             "input": [
-                // valid assistant turn: has reasoning text → KEEP
-                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking A"}]},
+                {"type": "reasoning", "summary": [], "encrypted_content": "thinking A"},
                 {"type": "function_call", "call_id": "c1", "name": "f1", "arguments": "{}"},
                 {"type": "function_call_output", "call_id": "c1", "output": "out1"},
-                // bad assistant turn: tool_calls but no reasoning → DROP (and its tool output)
                 {"type": "function_call", "call_id": "c2", "name": "f2", "arguments": "{}"},
                 {"type": "function_call_output", "call_id": "c2", "output": "out2"},
-                // valid user message → KEEP
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]},
             ]
         });
@@ -1915,26 +1993,96 @@ mod tests {
             translate_request(&serde_json::to_vec(&codex).unwrap(), "mimo-v2.5-pro").unwrap();
         let v = parse(&body);
         let messages = v["messages"].as_array().unwrap();
-        // Expected after pruning:
-        //   [0] assistant (kept — reasoning_content non-empty, has c1 tool_call)
-        //   [1] tool      (kept — output of c1)
-        //   [2] user      (kept — final user msg)
-        // The c2 turn was dropped because reasoning_content was empty for it,
-        // but it appears the c1 and c2 calls coalesced into one assistant message
-        // during normalization. Verify no tool message for c2 leaks through.
-        let has_c2_tool = messages.iter().any(|m| {
+        // 历史不再丢：c2 的 tool output 也得在
+        let c1_present = messages.iter().any(|m| {
+            m.get("tool_call_id").and_then(Value::as_str) == Some("c1")
+        });
+        let c2_present = messages.iter().any(|m| {
             m.get("tool_call_id").and_then(Value::as_str) == Some("c2")
         });
-        assert!(!has_c2_tool, "tool output for dropped c2 must be pruned");
-        // The first assistant message should still carry tool_calls (from c1).
-        let first_assistant = messages
+        assert!(c1_present, "c1 tool output must be present");
+        assert!(c2_present, "c2 tool output must be present (no longer pruned)");
+        // reasoning_content 从 encrypted_content 提到 assistant 消息上了
+        let assistant = messages
             .iter()
             .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-            .expect("expected at least one assistant message");
+            .expect("expected assistant message");
         assert_eq!(
-            first_assistant.get("reasoning_content").and_then(Value::as_str),
-            Some("thinking A")
+            assistant.get("reasoning_content").and_then(Value::as_str),
+            Some("thinking A"),
+            "encrypted_content should round-trip into chat reasoning_content"
         );
+    }
+
+    #[test]
+    fn namespace_tool_recursively_expanded() {
+        // codex 把 MCP 工具打包进 type=namespace；旧逻辑直接 drop 整组。
+        // 现在递归 flatten 出去，模型才能调到这些工具。
+        // 注：codex Responses API 把 function tool 序列化成 nested 形态
+        // ({type, function:{name,...}})，跟 chat_completions tools 数组一致。
+        let codex = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "tools": [
+                {"type": "namespace", "name": "ns1", "tools": [
+                    {"type": "function", "function": {"name": "inner_a", "description": "a", "parameters": {"type": "object"}}},
+                    {"type": "function", "function": {"name": "inner_b", "description": "b", "parameters": {"type": "object"}}},
+                ]},
+                {"type": "function", "function": {"name": "top", "parameters": {"type": "object"}}},
+            ],
+        });
+        let (body, _state) =
+            translate_request(&serde_json::to_vec(&codex).unwrap(), "glm-5.1").unwrap();
+        let v = parse(&body);
+        let tools = v["tools"].as_array().unwrap();
+        let names: Vec<String> = tools
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str).map(String::from))
+            .collect();
+        assert!(names.contains(&"inner_a".to_string()), "namespace inner_a should be flattened: {:?}", names);
+        assert!(names.contains(&"inner_b".to_string()), "namespace inner_b should be flattened: {:?}", names);
+        assert!(names.contains(&"top".to_string()), "top-level function should survive: {:?}", names);
+    }
+
+    #[test]
+    fn custom_tool_mapped_to_function() {
+        // codex `custom` freeform tool（grammar-constrained 等）→ 普通 function tool
+        // 带 input: string 参数，让模型至少能调用。
+        let codex = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "tools": [
+                {"type": "custom", "name": "apply_patch", "description": "Apply a patch.", "format": {"type": "grammar"}},
+            ],
+        });
+        let (body, _state) =
+            translate_request(&serde_json::to_vec(&codex).unwrap(), "glm-5.1").unwrap();
+        let v = parse(&body);
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        let f = &tools[0]["function"];
+        assert_eq!(f["name"], "apply_patch");
+        assert!(f["description"].as_str().unwrap_or("").contains("grammar"));
+        assert!(f["parameters"]["properties"]["input"].is_object());
+    }
+
+    #[test]
+    fn local_shell_mapped_to_shell_function() {
+        // codex 的 `local_shell` builtin → 普通 `shell` function tool
+        // （schema 完整，让 chat_completions 上游能正确生成 tool_call）
+        let codex = json!({
+            "model": "gpt-5",
+            "input": "ls",
+            "tools": [{"type": "local_shell"}],
+        });
+        let (body, _state) =
+            translate_request(&serde_json::to_vec(&codex).unwrap(), "glm-5.1").unwrap();
+        let v = parse(&body);
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        let f = &tools[0]["function"];
+        assert_eq!(f["name"], "shell");
+        assert!(f["parameters"]["properties"]["command"].is_object());
     }
 
     #[test]
