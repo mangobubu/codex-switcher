@@ -5152,6 +5152,7 @@ mod tests {
             relay_model_fallback: None,
             relay_protocol: None,
             relay_category: None,
+            is_session_anchor: false,
         }
     }
 

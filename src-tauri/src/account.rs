@@ -1724,4 +1724,177 @@ mod tests {
         let changed = store.sync_account_from_auth_json(&account.id, external);
         assert!(!changed, "refresh token equality must not be enough");
     }
+
+    // ===== session-anchor (手机锚) v0.7+ =====
+
+    /// 构造一个 access_token 以 `eyJ` 开头的 OAuth 鉴权 JSON。
+    /// 必要：`effective_kind()` 用 `access_token` 前缀派生 kind=ChatgptOauth，
+    /// 而 `is_session_anchor` 的前置校验调用的是 `is_chatgpt_oauth()` → effective_kind。
+    fn oauth_auth(email: &str, account_id: &str, refresh_token: &str) -> Value {
+        let fake_jwt_at = format!(
+            "eyJ.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(format!(r#"{{"sub":"{}"}}"#, account_id))
+        );
+        serde_json::json!({
+            "tokens": {
+                "account_id": account_id,
+                "refresh_token": refresh_token,
+                "id_token": make_id_token(email, account_id),
+                "access_token": fake_jwt_at,
+            }
+        })
+    }
+
+    fn make_oauth_store() -> (AccountStore, String, String) {
+        let mut store = AccountStore::default();
+        // 两个 OAuth 订阅号 + 一个 Relay
+        let a = store.add_account(
+            "pro@example.com".to_string(),
+            oauth_auth("pro@example.com", "acct-pro", "rt-pro"),
+            None,
+        );
+        let b = store.add_account(
+            "free@example.com".to_string(),
+            oauth_auth("free@example.com", "acct-free", "rt-free"),
+            None,
+        );
+        (store, a.id, b.id)
+    }
+
+    fn add_relay(store: &mut AccountStore, name: &str) -> String {
+        let acc = store.add_relay_account(
+            name.to_string(),
+            "https://example.com".to_string(),
+            "sk-fake-key".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("responses".to_string()),
+            None,
+        );
+        acc.id
+    }
+
+    #[test]
+    fn anchor_can_be_set_on_oauth_account() {
+        let (mut store, pro_id, _free_id) = make_oauth_store();
+        assert!(store.session_anchor_id().is_none(), "新 store 默认无 anchor");
+
+        store.set_session_anchor(&pro_id, true).expect("OAuth 号可以当 anchor");
+
+        assert_eq!(store.session_anchor_id().as_deref(), Some(pro_id.as_str()));
+        assert!(store.accounts.get(&pro_id).unwrap().is_session_anchor);
+    }
+
+    #[test]
+    fn anchor_is_mutually_exclusive() {
+        let (mut store, pro_id, free_id) = make_oauth_store();
+
+        store.set_session_anchor(&pro_id, true).unwrap();
+        // 切到 free —— pro 的 anchor 必须被清掉
+        store.set_session_anchor(&free_id, true).unwrap();
+
+        assert_eq!(store.session_anchor_id().as_deref(), Some(free_id.as_str()));
+        assert!(!store.accounts.get(&pro_id).unwrap().is_session_anchor);
+        assert!(store.accounts.get(&free_id).unwrap().is_session_anchor);
+
+        let anchor_count = store
+            .accounts
+            .values()
+            .filter(|a| a.is_session_anchor)
+            .count();
+        assert_eq!(anchor_count, 1, "整个 store 永远 ≤ 1 个 anchor");
+    }
+
+    #[test]
+    fn anchor_disable_clears_flag() {
+        let (mut store, pro_id, _) = make_oauth_store();
+        store.set_session_anchor(&pro_id, true).unwrap();
+        store.set_session_anchor(&pro_id, false).unwrap();
+
+        assert!(store.session_anchor_id().is_none());
+        assert!(!store.accounts.get(&pro_id).unwrap().is_session_anchor);
+    }
+
+    #[test]
+    fn anchor_rejected_on_relay_account() {
+        let mut store = AccountStore::default();
+        let relay_id = add_relay(&mut store, "GLM-relay");
+
+        let err = store
+            .set_session_anchor(&relay_id, true)
+            .expect_err("Relay 号不应该能当 anchor");
+        assert!(
+            err.contains("ChatGPT 订阅号"),
+            "错误消息要解释为什么被拒绝，实际: {}",
+            err
+        );
+
+        // 状态必须没被污染
+        assert!(store.session_anchor_id().is_none());
+        assert!(!store.accounts.get(&relay_id).unwrap().is_session_anchor);
+    }
+
+    #[test]
+    fn anchor_rejected_on_nonexistent_account() {
+        let mut store = AccountStore::default();
+        let err = store
+            .set_session_anchor("not-a-real-id", true)
+            .expect_err("不存在的 id 应该返回错");
+        assert!(err.contains("不存在"));
+    }
+
+    #[test]
+    fn should_write_disk_for_without_anchor_is_always_true() {
+        let (store, pro_id, free_id) = make_oauth_store();
+        assert!(store.should_write_disk_for(&pro_id));
+        assert!(store.should_write_disk_for(&free_id));
+        assert!(
+            store.should_write_disk_for("any-random-id"),
+            "无 anchor 时谁都能写盘（旧行为）"
+        );
+    }
+
+    #[test]
+    fn should_write_disk_for_only_allows_anchor_when_set() {
+        let (mut store, pro_id, free_id) = make_oauth_store();
+        store.set_session_anchor(&pro_id, true).unwrap();
+
+        assert!(
+            store.should_write_disk_for(&pro_id),
+            "anchor 自己写盘是允许的（保持 disk 是 anchor 镜像）"
+        );
+        assert!(
+            !store.should_write_disk_for(&free_id),
+            "非 anchor 号触发的写盘必须被屏蔽"
+        );
+        assert!(
+            !store.should_write_disk_for("random-id"),
+            "任何非 anchor id 都被屏蔽"
+        );
+    }
+
+    #[test]
+    fn anchor_survives_clearing_disabled_target() {
+        // set_session_anchor(other_id, false) 不应该影响 pro 的 anchor 标记
+        let (mut store, pro_id, free_id) = make_oauth_store();
+        store.set_session_anchor(&pro_id, true).unwrap();
+        store.set_session_anchor(&free_id, false).unwrap();
+
+        assert_eq!(store.session_anchor_id().as_deref(), Some(pro_id.as_str()));
+    }
+
+    #[test]
+    fn restore_disk_real_expiry_for_anchor_skips_when_no_anchor() {
+        let (store, _, _) = make_oauth_store();
+        // 无 anchor 时函数返回 Ok(false) —— 表示没动盘，是正确行为
+        let did_write = store
+            .restore_disk_real_expiry_for_anchor()
+            .expect("无 anchor 时不报错");
+        assert!(!did_write, "无 anchor 时不该写盘");
+    }
 }
