@@ -439,7 +439,6 @@ function App() {
             onAddRelay={() => setShowRelayModal(true)}
             onRefreshUsage={refreshUsage}
             usageLoading={usageLoading}
-            onSetSessionAnchor={setSessionAnchor}
           />
         ) : currentPage === 'proxy' ? (
           <Proxy />
@@ -452,7 +451,7 @@ function App() {
         ) : currentPage === 'skills' ? (
           <Skills />
         ) : (
-          <Settings />
+          <Settings accounts={accounts} onSetSessionAnchor={setSessionAnchor} />
         )}
       </main>
 

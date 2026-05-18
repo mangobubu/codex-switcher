@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge, Smartphone } from 'lucide-react';
+import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge } from 'lucide-react';
 import { Account, AppSettings, RelayUsageCache, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -54,7 +54,6 @@ interface AccountListProps {
     onAddRelay?: () => void;
     onRefreshUsage?: () => void;
     usageLoading?: boolean;
-    onSetSessionAnchor?: (id: string, enabled: boolean) => Promise<void>;
 }
 
 export function AccountList({
@@ -69,7 +68,6 @@ export function AccountList({
     onDelete,
     onUpdateSettings,
     onRefreshComplete,
-    onSetSessionAnchor,
 }: AccountListProps) {
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [refreshingIds, setRefreshingIds] = useState<Set<string>>(new Set());
@@ -569,20 +567,6 @@ export function AccountList({
                                 </div>
                                 <div className="col-actions">
                                     <button className="action-btn refresh" onClick={() => handleRefreshOne(acc.id)} disabled={isRefreshing} title="刷新"><RefreshCw size={14} className={isRefreshing ? 'spinning' : ''} /></button>
-                                    {/* 手机锚只对 ChatGPT 订阅号开放：
-                                        Codex.app `/codex/remote/control/*` 必须用 chatgpt_account_id 鉴权，
-                                        Relay / OpenAI API key 没有这个 claim，设了也是给 Codex.app 喂垃圾 */}
-                                    {onSetSessionAnchor && effectiveKind(acc) === 'chatgpt_oauth' && (
-                                        <button
-                                            className={`action-btn anchor ${acc.is_session_anchor ? 'on' : ''}`}
-                                            onClick={() => onSetSessionAnchor(acc.id, !acc.is_session_anchor)}
-                                            title={acc.is_session_anchor
-                                                ? '点击取消手机锚（disk auth.json 回到跟随 current 的旧行为）'
-                                                : '设为手机锚：disk auth.json 永远跟此号走，切到其他号时 Codex.app 仍以此号身份在线，手机 bridge 不掉线'}
-                                        >
-                                            <Smartphone size={14} />
-                                        </button>
-                                    )}
                                     {settings.remote_mode === 'client' && (
                                         <button
                                             className="action-btn push"

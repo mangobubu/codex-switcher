@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Palette, Server, Monitor, Wrench, Save, Github, Radio } from 'lucide-react';
+import { Palette, Server, Monitor, Wrench, Save, Github, Radio, Smartphone, Search, X } from 'lucide-react';
+import { Account, effectiveKind } from '../hooks/useAccounts';
 import './Settings.css';
 
 interface AppSettings {
@@ -43,7 +44,12 @@ const IDE_OPTIONS = [
     { value: 'Codex', label: 'Codex App' },
 ];
 
-export function Settings() {
+interface SettingsProps {
+    accounts?: Account[];
+    onSetSessionAnchor?: (id: string, enabled: boolean) => Promise<void>;
+}
+
+export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = {}) {
     const [settings, setSettings] = useState<AppSettings>({
         auto_reload_ide: false,
         primary_ide: 'Windsurf',
@@ -74,6 +80,28 @@ export function Settings() {
     const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     const [remoteBusy, setRemoteBusy] = useState(false);
     const [remoteStatus, setRemoteStatus] = useState<string>('');
+    const [showAnchorPicker, setShowAnchorPicker] = useState(false);
+    const [anchorSearch, setAnchorSearch] = useState('');
+    const [anchorBusy, setAnchorBusy] = useState(false);
+
+    // 手机锚只对 ChatGPT 订阅号有效：Codex.app `/codex/remote/control/*`
+    // 必须用 chatgpt_account_id 鉴权；Relay / OpenAI API key 没有这个 claim。
+    const anchorAccount = useMemo(
+        () => accounts.find(a => a.is_session_anchor) || null,
+        [accounts]
+    );
+    const anchorCandidates = useMemo(
+        () => accounts.filter(a => effectiveKind(a) === 'chatgpt_oauth'),
+        [accounts]
+    );
+    const filteredAnchorCandidates = useMemo(() => {
+        const q = anchorSearch.trim().toLowerCase();
+        if (!q) return anchorCandidates;
+        return anchorCandidates.filter(a => {
+            const plan = (a.cached_quota?.plan_type || '').toLowerCase();
+            return a.name.toLowerCase().includes(q) || plan.includes(q);
+        });
+    }, [anchorCandidates, anchorSearch]);
 
     useEffect(() => {
         loadSettings();
@@ -181,6 +209,38 @@ export function Settings() {
             const s = await invoke<string>('remote_restart_server');
             return s;
         });
+
+    const handleBindAnchor = async (id: string) => {
+        if (!onSetSessionAnchor) return;
+        setAnchorBusy(true);
+        setMessage(null);
+        try {
+            await onSetSessionAnchor(id, true);
+            setMessage({ type: 'success', text: '✅ 已设为手机锚' });
+            setTimeout(() => setMessage(null), 3000);
+            setShowAnchorPicker(false);
+            setAnchorSearch('');
+        } catch (e) {
+            setMessage({ type: 'error', text: `❌ 绑定失败：${e}` });
+        } finally {
+            setAnchorBusy(false);
+        }
+    };
+
+    const handleUnbindAnchor = async () => {
+        if (!onSetSessionAnchor || !anchorAccount) return;
+        setAnchorBusy(true);
+        setMessage(null);
+        try {
+            await onSetSessionAnchor(anchorAccount.id, false);
+            setMessage({ type: 'success', text: '✅ 已解除手机锚绑定' });
+            setTimeout(() => setMessage(null), 3000);
+        } catch (e) {
+            setMessage({ type: 'error', text: `❌ 解除失败：${e}` });
+        } finally {
+            setAnchorBusy(false);
+        }
+    };
 
     const handleRepair = async () => {
         if (!confirm('这将尝试移除 Codex App 的安全隔离属性。\n\n系统可能会弹窗要求输入密码以获得权限。是否继续？')) {
@@ -615,6 +675,52 @@ export function Settings() {
                 )}
             </div>
 
+            {onSetSessionAnchor && (
+                <div className="settings-section">
+                    <h3><Smartphone size={16} /> Codex.app 手机锚绑定</h3>
+                    <div className="setting-item">
+                        <div className="setting-info">
+                            <span className="setting-label">当前绑定账号</span>
+                            <span className="setting-desc">
+                                磁盘 ~/.codex/auth.json 永远跟随此号，Codex.app 手机远程连接绑定此号；
+                                切到其他号时 disk 不动、proxy 出口照切（手机 bridge 不掉线）。
+                                仅 ChatGPT 订阅号可绑定。
+                            </span>
+                        </div>
+                        <div className="anchor-actions">
+                            <span className={`anchor-current ${anchorAccount ? 'bound' : 'unbound'}`}>
+                                {anchorAccount ? (
+                                    <>
+                                        📱 {anchorAccount.name}
+                                        <span className={`anchor-current-plan plan-${(anchorAccount.cached_quota?.plan_type || 'unknown').toLowerCase()}`}>
+                                            {anchorAccount.cached_quota?.plan_type
+                                                ? anchorAccount.cached_quota.plan_type.toUpperCase()
+                                                : '未知'}
+                                        </span>
+                                    </>
+                                ) : '未绑定'}
+                            </span>
+                            <button
+                                className="action-button"
+                                onClick={() => { setAnchorSearch(''); setShowAnchorPicker(true); }}
+                                disabled={anchorBusy}
+                            >
+                                {anchorAccount ? '更换' : '选择绑定账号'}
+                            </button>
+                            {anchorAccount && (
+                                <button
+                                    className="action-button warning"
+                                    onClick={handleUnbindAnchor}
+                                    disabled={anchorBusy}
+                                >
+                                    解除
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
             <div className="settings-section danger">
                 <h3><Wrench size={16} /> 故障修复</h3>
                 <div className="setting-item">
@@ -631,6 +737,68 @@ export function Settings() {
                     </button>
                 </div>
             </div>
+
+            {showAnchorPicker && (
+                <div className="modal-overlay" onClick={() => !anchorBusy && setShowAnchorPicker(false)}>
+                    <div className="anchor-picker" onClick={e => e.stopPropagation()}>
+                        <div className="anchor-picker-header">
+                            <div>
+                                <h3>选择手机锚账号</h3>
+                                <p className="anchor-picker-hint">
+                                    仅 ChatGPT 订阅号可绑定（Codex.app 远程连接需要 chatgpt_account_id 鉴权）
+                                </p>
+                            </div>
+                            <button
+                                className="anchor-picker-close"
+                                onClick={() => setShowAnchorPicker(false)}
+                                disabled={anchorBusy}
+                                title="关闭"
+                            >
+                                <X size={16} />
+                            </button>
+                        </div>
+                        <div className="anchor-picker-search">
+                            <Search size={14} />
+                            <input
+                                type="text"
+                                placeholder="搜索邮箱 / 订阅类型 (如 team / pro / free)…"
+                                value={anchorSearch}
+                                onChange={e => setAnchorSearch(e.target.value)}
+                                autoFocus
+                            />
+                        </div>
+                        <div className="anchor-picker-list">
+                            {filteredAnchorCandidates.length === 0 ? (
+                                <div className="anchor-picker-empty">
+                                    {anchorCandidates.length === 0
+                                        ? '当前没有 ChatGPT 订阅号'
+                                        : '没有匹配的账号'}
+                                </div>
+                            ) : (
+                                filteredAnchorCandidates.map(acc => {
+                                    const plan = acc.cached_quota?.plan_type;
+                                    const planLabel = plan ? plan.toUpperCase() : '未知';
+                                    const planClass = (plan || 'unknown').toLowerCase();
+                                    return (
+                                        <button
+                                            key={acc.id}
+                                            className={`anchor-picker-item ${acc.is_session_anchor ? 'current' : ''}`}
+                                            onClick={() => handleBindAnchor(acc.id)}
+                                            disabled={anchorBusy || acc.is_session_anchor}
+                                        >
+                                            <span className="anchor-picker-name">{acc.name}</span>
+                                            <span className={`anchor-picker-plan plan-${planClass}`}>{planLabel}</span>
+                                            {acc.is_session_anchor && (
+                                                <span className="anchor-picker-tag">✓ 当前绑定</span>
+                                            )}
+                                        </button>
+                                    );
+                                })
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
 
             <div className="settings-section">
                 <h3><Github size={16} /> 关于</h3>
