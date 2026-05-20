@@ -4,6 +4,22 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// 进程级共享 reqwest::Client — 整个 quota 刷新链路共用一个连接池，
+/// 不再每个账号都跑一次 TLS 握手。30 秒空闲回收，最多 8 个 keep-alive。
+fn usage_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(6))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
+            .build()
+            .expect("build shared usage reqwest client")
+    })
+}
 
 /// 前端展示的用量数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,19 +68,21 @@ impl UsageFetcher {
         let mut current_token = access_token;
         let mut new_tokens: Option<crate::oauth::TokenResponse> = None;
 
-        let client = reqwest::Client::new();
+        let client = usage_client();
         let user_agent = format!(
             "codex_cli_rs/{} (Mac OS; x86_64) codex-cli",
             env!("CARGO_PKG_VERSION")
         );
         let build_request = |at: &str, aid: &Option<String>| {
+            // 12s 是经验值：正常 < 2s，5s+ 已经是慢路径，>12s 基本可以判定为节流/超时。
+            // 之前 30s 让 "刷新全部" 的尾延迟被个别慢账号拖很久。
             let mut req = client
                 .get("https://chatgpt.com/backend-api/wham/usage")
                 .header("Authorization", format!("Bearer {}", at))
                 .header("User-Agent", &user_agent)
                 .header("originator", "codex_cli_rs")
                 .header("Accept", "application/json")
-                .timeout(std::time::Duration::from_secs(30));
+                .timeout(Duration::from_secs(12));
             if let Some(id) = aid {
                 req = req.header("ChatGPT-Account-Id", id);
             }

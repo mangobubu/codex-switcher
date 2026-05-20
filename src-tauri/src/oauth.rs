@@ -2,11 +2,28 @@ use base64::{engine::general_purpose, Engine as _};
 use rand::{rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 /// OpenAI 官方授权常量 (参考 codex-main)
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+/// 进程级共享 reqwest::Client：连接池可复用，避免每次 quota 刷新都跑 TLS 握手。
+/// 给整个请求加了一个 connect+request 双限，避免少数账号让 /oauth/token 无限期挂起
+/// （之前 heydsoneicke@gmail.com 的 "刷新不回来" 就是这个 case）。
+fn token_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(6))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
+            .build()
+            .expect("build shared oauth reqwest client")
+    })
+}
 
 /// PKCE 相关的代码
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,8 +73,6 @@ pub async fn exchange_code(
     redirect_uri: &str,
     code_verifier: &str,
 ) -> Result<TokenResponse, String> {
-    let client = reqwest::Client::new();
-
     // 官方格式: 手动拼接字符串
     let body = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
@@ -67,9 +82,10 @@ pub async fn exchange_code(
         urlencoding::encode(code_verifier)
     );
 
-    let response = client
+    let response = token_client()
         .post(TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(Duration::from_secs(20))
         .body(body)
         .send()
         .await
@@ -88,8 +104,6 @@ pub async fn exchange_code(
 
 /// 使用刷新令牌获取新访问令牌
 pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, String> {
-    let client = reqwest::Client::new();
-
     let params = [
         ("grant_type", "refresh_token"),
         ("client_id", CLIENT_ID),
@@ -97,9 +111,12 @@ pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, 
         ("scope", "openid profile email offline_access"),
     ];
 
-    let response = client
+    // 关键：之前没 timeout，OpenAI 边缘把这个账号 hang 住时整条 quota 刷新永久卡死。
+    // 15s 是经验值：正常 < 1s 完成，10s+ 基本可以判定为边缘节流/限流。
+    let response = token_client()
         .post(TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(Duration::from_secs(15))
         .form(&params)
         .send()
         .await

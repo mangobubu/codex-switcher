@@ -24,7 +24,24 @@ interface AddAccountModalProps {
     onSuccess?: () => void;  // 添加成功后的回调，用于刷新父组件列表
 }
 
-type TabType = 'official' | 'openai' | 'otp_batch' | 'bulk' | 'relay';
+type TabType = 'official' | 'openai' | 'otp_batch' | 'bulk' | 'relay' | 'session';
+
+interface ImportedSessionInfo {
+    email: string | null;
+    plan_type: string | null;
+    account_id: string | null;
+    expires_at: string | null;
+    has_refresh_token: boolean;
+    id_token_synthetic: boolean;
+}
+interface ImportedAccountItem {
+    account: { id: string; name: string };
+    info: ImportedSessionInfo;
+}
+interface ImportSessionResult {
+    ok: ImportedAccountItem[];
+    errors: { source_path: string; reason: string }[];
+}
 
 interface BulkImportSummary {
     format: string;
@@ -177,6 +194,11 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
     const [bulkBusy, setBulkBusy] = useState(false);
     const [bulkResult, setBulkResult] = useState<BulkImportResult | null>(null);
     const [bulkError, setBulkError] = useState<string | null>(null);
+    // ChatGPT Web session 导入（无 refresh_token，access_token 过期前可用）
+    const [sessionInput, setSessionInput] = useState('');
+    const [sessionBusy, setSessionBusy] = useState(false);
+    const [sessionResult, setSessionResult] = useState<ImportSessionResult | null>(null);
+    const [sessionError, setSessionError] = useState<string | null>(null);
     // 当前提交：用于失败重试时，把 OtpEntry 数组（含 token）映射回 otpRows 行
     const [otpSubmission, setOtpSubmission] = useState<{
         entries: OtpEntry[];
@@ -375,6 +397,31 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
         }
     };
 
+    // 复制授权链接（不开默认浏览器，让用户自己选要用哪个浏览器粘贴）
+    const handleCopyOAuthLink = async () => {
+        setLoading(true);
+        setError(null);
+        setOauthStatus('正在生成授权链接...');
+
+        try {
+            const url = await startOAuthLogin(false);
+            // 走后端 pbcopy 而不是 navigator.clipboard：webview 跨 await 后 user-gesture 失效会触发 NotAllowedError
+            try {
+                await invoke('copy_to_clipboard', { text: url });
+                setOauthStatus('授权链接已复制，请粘贴到目标浏览器完成授权，回调会自动回到本应用...');
+            } catch (copyErr) {
+                // 复制失败也别卡住流程：把 URL 显示出来让用户手动复制
+                setCallbackInput(url);
+                setShowPasteInput(false);
+                setOauthStatus(`复制到剪贴板失败（${String(copyErr)}），请手动复制：\n${url}`);
+            }
+        } catch (err) {
+            setError(String(err));
+            setOauthStatus('');
+            setLoading(false);
+        }
+    };
+
     const handleClose = () => {
         // OAuth 进行中也允许关闭：后端 oauth_server 下次 start 时会 abort 旧任务，无需显式取消
         setName('');
@@ -390,6 +437,10 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
             setOtpRows([]);
         }
         // 批量导入结果保留到下次打开（用户可能想再回来看），但 bulkBusy 防误触
+        // Session 导入：成功后清空输入避免重复提交；保留 result 供回头看
+        if (sessionResult && sessionResult.ok.length > 0) {
+            setSessionInput('');
+        }
         onClose();
     };
 
@@ -419,6 +470,33 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
             setBulkError(`${e}`);
         } finally {
             setBulkBusy(false);
+        }
+    };
+
+    // ChatGPT Web session 导入：粘贴 chatgpt.com 的 session JSON（带 accessToken）
+    // → 转成我们的 auth.json 并落库。源逻辑参考 gtxx3600/GPTSession2CPAandSub2API。
+    // 没有 refresh_token，约 30 天后 access_token 过期需要重新导入。
+    const handleSessionImport = async () => {
+        setSessionError(null);
+        setSessionResult(null);
+        if (!sessionInput.trim()) {
+            setSessionError('请粘贴 ChatGPT session JSON');
+            return;
+        }
+        setSessionBusy(true);
+        try {
+            const r = await invoke<ImportSessionResult>('import_chatgpt_session', {
+                sessionJson: sessionInput,
+            });
+            setSessionResult(r);
+            if (r.ok.length > 0) {
+                await emit('accounts-updated');
+                onSuccess?.();
+            }
+        } catch (e: any) {
+            setSessionError(String(e));
+        } finally {
+            setSessionBusy(false);
         }
     };
 
@@ -557,6 +635,12 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                         >
                             批量导入文件
                         </button>
+                        <button
+                            className={`tab-item ${activeTab === 'session' ? 'active' : ''}`}
+                            onClick={() => !loading && !otpRunning && setActiveTab('session')}
+                        >
+                            Session 导入
+                        </button>
                         {/* "中转站" tab moved to dedicated AddRelayModal — see App.tsx 顶部 "+ 添加中转" 按钮 */}
                     </div>
                 </div>
@@ -622,6 +706,89 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                                     ))}
                                                 </tbody>
                                             </table>
+                                        </details>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    ) : activeTab === 'session' ? (
+                        <div className="bulk-panel">
+                            <p className="modal-tip">
+                                粘贴 <b>chatgpt.com 网页登录的 session JSON</b>（带 <code>accessToken / user.email / account.id</code>），
+                                绕过 Codex 手机验证。支持单个对象、对象数组、或者嵌套容器，会自动递归识别。
+                                <br />
+                                <b style={{ color: 'var(--text-secondary)' }}>注意：</b>
+                                Web session 没有 <code>refresh_token</code>，<code>access_token</code> 失效（约 30 天）后账号会变成不可用，
+                                需要重新粘贴一次新 session。Plus 账号能正常调用模型，Free 账号即使导入也无 API 权限。
+                            </p>
+                            <textarea
+                                className="text-input"
+                                style={{ width: '100%', minHeight: 260, fontFamily: 'monospace', fontSize: 12 }}
+                                value={sessionInput}
+                                onChange={e => setSessionInput(e.target.value)}
+                                placeholder={`{\n  "user": {"id": "user-...", "email": "you@example.com"},\n  "expires": "2026-08-06T14:29:36.155Z",\n  "account": {"id": "uuid", "planType": "plus"},\n  "accessToken": "eyJhbGciOi...",\n  "sessionToken": "..."\n}`}
+                                disabled={sessionBusy}
+                            />
+                            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                                <button
+                                    className="btn btn-primary"
+                                    style={{ flex: 1, padding: '12px' }}
+                                    onClick={handleSessionImport}
+                                    disabled={sessionBusy || !sessionInput.trim()}
+                                >
+                                    {sessionBusy ? '导入中…' : '解析并导入'}
+                                </button>
+                                <button
+                                    className="btn btn-ghost"
+                                    onClick={() => { setSessionInput(''); setSessionResult(null); setSessionError(null); }}
+                                    disabled={sessionBusy || (!sessionInput && !sessionResult && !sessionError)}
+                                >
+                                    清空
+                                </button>
+                            </div>
+                            {sessionError && <div className="error-message" style={{ marginTop: 12 }}>{sessionError}</div>}
+                            {sessionResult && (
+                                <div className="bulk-result" style={{ marginTop: 16 }}>
+                                    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+                                        <span className="bulk-stat ok">新增 {sessionResult.ok.length}</span>
+                                        {sessionResult.errors.length > 0 && (
+                                            <span className="bulk-stat fail">失败 {sessionResult.errors.length}</span>
+                                        )}
+                                    </div>
+                                    {sessionResult.ok.length > 0 && (
+                                        <details open style={{ marginTop: 8 }}>
+                                            <summary style={{ cursor: 'pointer', color: 'var(--text-secondary)', fontSize: 12.5, padding: '6px 0' }}>
+                                                导入账号详情（{sessionResult.ok.length}）
+                                            </summary>
+                                            <table className="bulk-table">
+                                                <thead>
+                                                    <tr><th>Email</th><th>Plan</th><th>说明</th></tr>
+                                                </thead>
+                                                <tbody>
+                                                    {sessionResult.ok.map((item, i) => (
+                                                        <tr key={i}>
+                                                            <td>{item.info.email || item.account.name}</td>
+                                                            <td>{item.info.plan_type || '—'}</td>
+                                                            <td>
+                                                                {item.info.has_refresh_token
+                                                                    ? '✓ 含 refresh_token'
+                                                                    : <span className="needs-refresh">⚠ 无 refresh_token，到期后需重新导入</span>}
+                                                                {item.info.id_token_synthetic ? '（id_token 合成）' : ''}
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </details>
+                                    )}
+                                    {sessionResult.errors.length > 0 && (
+                                        <details open style={{ marginTop: 8 }}>
+                                            <summary style={{ cursor: 'pointer', color: 'var(--danger, #c54)', fontSize: 12.5, padding: '6px 0' }}>
+                                                失败项（{sessionResult.errors.length}）
+                                            </summary>
+                                            {sessionResult.errors.map((err, i) => (
+                                                <div key={i} className="bulk-fatal">⚠ {err.source_path}: {err.reason}</div>
+                                            ))}
                                         </details>
                                     )}
                                 </div>
@@ -950,6 +1117,17 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                 disabled={loading}
                             >
                                 {loading && oauthStatus ? '处理中...' : '立即登录 OpenAI'}
+                            </button>
+
+                            <button
+                                className="btn btn-ghost btn-full"
+                                style={{ marginTop: '8px' }}
+                                onClick={handleCopyOAuthLink}
+                                disabled={loading}
+                                type="button"
+                                title="不打开默认浏览器，把授权链接复制到剪贴板，由你粘贴到目标浏览器"
+                            >
+                                复制授权链接（指定浏览器登录）
                             </button>
 
                             {!loading && (

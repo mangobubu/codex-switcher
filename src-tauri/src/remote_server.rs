@@ -35,6 +35,29 @@ pub fn solo_is_active() -> bool {
     active_solo_until().load(Ordering::Relaxed) > chrono::Utc::now().timestamp()
 }
 
+/// 把 store.save() 丢到 tokio 的 blocking 线程池，避免 ~200KB JSON 序列化 + fs::write
+/// 占着 std::sync::Mutex 卡死 worker pool。
+///
+/// 背景：之前 client 模式批量 refresh-all（30+ 账号并发）每个 handler 都在 worker
+/// 线程里 lock → save → unlock，30 把 lock 串行 + 每次 fs::write 几十毫秒，叠加
+/// oauth refresh 无 timeout，最终把 Tokio worker 全部卡死，admin HTTP server 的
+/// accept loop 都跑不了 — 表现就是「点刷新无响应、TCP timeout」。
+///
+/// 这里只把"持久化"动作搬到 blocking 池：调用者在 worker 线程上完成 mutation 后
+/// 立刻 drop lock，然后 schedule_save 拿 Arc clone 在另一个线程里 lock+save，
+/// 即便 save 那一刻还会短暂持锁，blocking 池被卡住也不会影响 admin server。
+pub(crate) fn schedule_save(store: Arc<Mutex<AccountStore>>) {
+    tokio::task::spawn_blocking(move || {
+        if let Ok(s) = store.lock() {
+            if let Err(e) = s.save() {
+                eprintln!("[Store] schedule_save 失败: {}", e);
+            }
+        } else {
+            eprintln!("[Store] schedule_save 拿不到锁（poisoned）");
+        }
+    });
+}
+
 struct ApiState {
     store: Arc<Mutex<AccountStore>>,
     secret: String,
@@ -396,7 +419,7 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                 if let Some(ref rt) = refresh_token {
                     match crate::oauth::refresh_access_token(rt).await {
                         Ok(tok) => {
-                            if let Ok(mut s) = state.store.lock() {
+                            let mutated = if let Ok(mut s) = state.store.lock() {
                                 if let Some(acc) = s.accounts.get_mut(&id) {
                                     AccountStore::apply_refreshed_tokens(
                                         acc,
@@ -405,8 +428,15 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                                         tok.id_token,
                                         tok.expires_in,
                                     );
-                                    let _ = s.save();
+                                    true
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
+                            };
+                            if mutated {
+                                schedule_save(state.store.clone());
                             }
                             Some(tok.access_token)
                         }
@@ -428,7 +458,7 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
             .await
         {
             Ok((usage, _)) => {
-                if let Ok(mut s) = state.store.lock() {
+                let mutated = if let Ok(mut s) = state.store.lock() {
                     if let Some(acc) = s.accounts.get_mut(&id) {
                         acc.cached_quota = Some(crate::account::CachedQuota {
                             five_hour_left: usage.five_hour_left as f64,
@@ -446,27 +476,38 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                         acc.is_banned = false;
                         acc.is_token_invalid = false;
                         acc.is_logged_out = false;
-                        let _ = s.save();
                         quota_refreshed = true;
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+                if mutated {
+                    schedule_save(state.store.clone());
                 }
                 let _ = state.app_handle.emit("accounts-updated", ());
             }
             Err(e) => {
+                let mut mutated = false;
                 if e.contains("ACCOUNT_BANNED") {
                     if let Ok(mut s) = state.store.lock() {
                         if let Some(a) = s.accounts.get_mut(&id) {
                             a.is_banned = true;
-                            let _ = s.save();
+                            mutated = true;
                         }
                     }
                 } else if e.contains("TOKEN_INVALID") {
                     if let Ok(mut s) = state.store.lock() {
                         if let Some(a) = s.accounts.get_mut(&id) {
                             a.is_token_invalid = true;
-                            let _ = s.save();
+                            mutated = true;
                         }
                     }
+                }
+                if mutated {
+                    schedule_save(state.store.clone());
                 }
                 quota_error = Some(e);
             }
@@ -560,7 +601,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
             };
             match crate::oauth::refresh_access_token(&rt).await {
                 Ok(tok) => {
-                    if let Ok(mut s) = state.store.lock() {
+                    let mutated = if let Ok(mut s) = state.store.lock() {
                         if let Some(acc) = s.accounts.get_mut(&id) {
                             AccountStore::apply_refreshed_tokens(
                                 acc,
@@ -569,8 +610,15 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                                 tok.id_token,
                                 tok.expires_in,
                             );
-                            let _ = s.save();
+                            true
+                        } else {
+                            false
                         }
+                    } else {
+                        false
+                    };
+                    if mutated {
+                        schedule_save(state.store.clone());
                     }
                     tok.access_token
                 }
@@ -593,7 +641,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
     .await
     {
         Ok((usage, _)) => {
-            if let Ok(mut s) = state.store.lock() {
+            let mutated = if let Ok(mut s) = state.store.lock() {
                 if let Some(acc) = s.accounts.get_mut(&id) {
                     acc.cached_quota = Some(crate::account::CachedQuota {
                         five_hour_left: usage.five_hour_left as f64,
@@ -611,34 +659,45 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                     acc.is_banned = false;
                     acc.is_token_invalid = false;
                     acc.is_logged_out = false;
-                    let _ = s.save();
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if mutated {
+                schedule_save(state.store.clone());
             }
             let _ = state.app_handle.emit("accounts-updated", ());
             json_resp(StatusCode::OK, json!({"ok": true, "usage": usage}))
         }
         Err(e) => {
+            let mut mutated = false;
             if e.contains("ACCOUNT_BANNED") {
                 if let Ok(mut s) = state.store.lock() {
                     if let Some(a) = s.accounts.get_mut(&id) {
                         a.is_banned = true;
-                        let _ = s.save();
+                        mutated = true;
                     }
                 }
             } else if e.contains("TOKEN_INVALID") {
                 if let Ok(mut s) = state.store.lock() {
                     if let Some(a) = s.accounts.get_mut(&id) {
                         a.is_token_invalid = true;
-                        let _ = s.save();
+                        mutated = true;
                     }
                 }
             } else if e.contains("ACCOUNT_LOGGED_OUT") {
                 if let Ok(mut s) = state.store.lock() {
                     if let Some(a) = s.accounts.get_mut(&id) {
                         a.is_logged_out = true;
-                        let _ = s.save();
+                        mutated = true;
                     }
                 }
+            }
+            if mutated {
+                schedule_save(state.store.clone());
             }
             json_resp(StatusCode::BAD_REQUEST, json!({"error": e}))
         }

@@ -21,6 +21,7 @@ mod remote_server;
 mod scheduler;
 pub mod sentinel;
 mod session_affinity;
+mod session_import;
 mod session_routes;
 mod skills;
 mod switch_log;
@@ -2119,31 +2120,64 @@ pub fn start_quota_refresh(
                 continue;
             }
 
-            // 按 cached_quota.updated_at 排序，最旧的优先
+            // 按 cached_quota.updated_at 排序，最旧的优先；但「窗口已 reset 但缓存还停留在
+            // reset 前」的账号是高优：默认 batch=1 时它们会被 N×interval 才轮到一次，
+            // 用户视角是「到点了也不刷新」。这里把 expired 账号集合优先取，再用普通
+            // batch 兜底，保证窗口刚 reset 的账号最迟下一个 5min 周期就被刷上。
             // Relay 账号的 quota 通过专属 fetcher 拉取，这里跳过避免无谓打 OpenAI usage API
             let targets: Vec<(String, String)> = {
                 let s = store.lock().unwrap();
-                let mut accounts: Vec<_> = s
+                let now_ts = chrono::Utc::now().timestamp();
+                let candidates: Vec<_> = s
                     .accounts
                     .values()
                     .filter(|a| {
                         !a.is_banned && !a.is_token_invalid && !a.is_logged_out && !a.is_relay()
                     })
                     .map(|a| {
-                        let updated = a
-                            .cached_quota
-                            .as_ref()
+                        let cq = a.cached_quota.as_ref();
+                        let updated = cq
                             .map(|q| q.updated_at)
                             .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-                        (a.id.clone(), a.name.clone(), updated)
+                        let five_reset = cq.and_then(|q| q.five_hour_reset_at).unwrap_or(0);
+                        let weekly_reset = cq.and_then(|q| q.weekly_reset_at).unwrap_or(0);
+                        let updated_ts = updated.timestamp();
+                        // expired = reset_at 已过 AND 缓存抓取早于 reset_at
+                        let five_expired = five_reset > 0
+                            && five_reset <= now_ts
+                            && updated_ts < five_reset;
+                        let weekly_expired = weekly_reset > 0
+                            && weekly_reset <= now_ts
+                            && updated_ts < weekly_reset;
+                        let expired = five_expired || weekly_expired;
+                        (a.id.clone(), a.name.clone(), updated, expired)
                     })
                     .collect();
-                // 最旧的排前面
-                accounts.sort_by_key(|(_, _, t)| *t);
-                accounts
+
+                // 1) expired 全部入选（不受 batch_size 限制 — reset 后必须及时刷）
+                let mut expired: Vec<_> =
+                    candidates.iter().filter(|(_, _, _, e)| *e).cloned().collect();
+                expired.sort_by_key(|(_, _, t, _)| *t);
+
+                // 2) 剩下的按 updated_at 最旧排序，取 batch_size 个
+                let mut rest: Vec<_> = candidates
+                    .iter()
+                    .filter(|(_, _, _, e)| !*e)
+                    .cloned()
+                    .collect();
+                rest.sort_by_key(|(_, _, t, _)| *t);
+
+                if !expired.is_empty() {
+                    println!(
+                        "[QuotaRefresh] 检测到 {} 个 window 已 reset 的账号，优先刷新",
+                        expired.len()
+                    );
+                }
+
+                expired
                     .into_iter()
-                    .take(batch_size as usize)
-                    .map(|(id, name, _)| (id, name))
+                    .chain(rest.into_iter().take(batch_size as usize))
+                    .map(|(id, name, _, _)| (id, name))
                     .collect()
             };
 
@@ -2273,17 +2307,19 @@ pub fn start_quota_refresh(
                     }
                 }
 
-                // 每个号之间间隔 interval_minutes 分钟
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    u64::from(interval_minutes) * 60,
-                ))
-                .await;
+                // 仅在账号之间隔一个温和的间隔（500ms），不再卡 interval_minutes —
+                // 之前是每个账号之间 5 分钟，10 个账号要 50 分钟，等于「窗口 reset 后
+                // 半小时配额还没刷出来」。整轮 batch 跑完之后才睡 interval_minutes。
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
 
-            // 如果没有目标，等一轮
-            if targets.is_empty() {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
+            // 整轮跑完后再 sleep 到下一周期（没有目标的时候缩短到 60s）
+            let next_sleep_secs = if targets.is_empty() {
+                60
+            } else {
+                u64::from(interval_minutes) * 60
+            };
+            tokio::time::sleep(tokio::time::Duration::from_secs(next_sleep_secs)).await;
         }
     })
 }
@@ -5054,6 +5090,8 @@ pub fn run() {
             get_quota_by_id,
             oauth_server::start_oauth_login,
             oauth_server::submit_oauth_callback,
+            oauth_server::copy_to_clipboard,
+            session_import::import_chatgpt_session,
             solo_sync_current,
             finalize_oauth_login,
             force_overwrite_disk_with_current,

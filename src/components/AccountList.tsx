@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge } from 'lucide-react';
 import { Account, AppSettings, RelayUsageCache, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
@@ -137,6 +137,62 @@ export function AccountList({
         setBannedIds(initialBanned);
     }, [accounts]);
 
+    // 自动 reset 后重拉：cached 数据老于 reset_at 时窗口已经重置但缓存还是旧的 0%，
+    // 触发一次 refresh。
+    // - 冷却 90s：足够让上一轮 invoke 完成且 accounts prop 拿到新 cached_quota；
+    //   失败的话 90s 后自动重试，最多 90s/次的开销可以接受
+    // - 跳过 refreshingIds 里在飞的，避免叠加
+    // - is_token_invalid/banned/logged_out 由 backend 持久化，前端尊重
+    const handleRefreshOneRef = useRef<(id: string) => Promise<void>>(async () => {});
+    const autoRefreshTsRef = useRef<Map<string, number>>(new Map());
+    const refreshingIdsRef = useRef<Set<string>>(new Set());
+    refreshingIdsRef.current = refreshingIds;
+    useEffect(() => {
+        const COOLDOWN_MS = 90 * 1000;
+        const AUTO_CONCURRENCY = 4;
+
+        const scan = () => {
+            const nowMs = Date.now();
+            const stale: string[] = [];
+            const reasons: Record<string, string> = {};
+            for (const acc of accounts) {
+                if (effectiveKind(acc) !== 'chatgpt_oauth') continue;
+                if (acc.is_banned || acc.is_token_invalid || acc.is_logged_out) continue;
+                const cq = acc.cached_quota;
+                if (!cq) continue;
+                const updatedAtMs = cq.updated_at ? new Date(cq.updated_at).getTime() : 0;
+                const fiveResetMs = (cq.five_hour_reset_at ?? 0) * 1000;
+                const weeklyResetMs = (cq.weekly_reset_at ?? 0) * 1000;
+                const needs5h = fiveResetMs > 0 && fiveResetMs <= nowMs && updatedAtMs < fiveResetMs;
+                const needsWk = weeklyResetMs > 0 && weeklyResetMs <= nowMs && updatedAtMs < weeklyResetMs;
+                if (!needs5h && !needsWk) continue;
+                if (refreshingIdsRef.current.has(acc.id)) continue;
+                const last = autoRefreshTsRef.current.get(acc.id) ?? 0;
+                if (nowMs - last < COOLDOWN_MS) continue;
+                autoRefreshTsRef.current.set(acc.id, nowMs);
+                stale.push(acc.id);
+                reasons[acc.id] = needs5h ? '5H' : 'weekly';
+            }
+            if (stale.length === 0) return;
+            console.log(`[AutoRefresh] 触发 ${stale.length} 个账号 reset 后自动刷新:`,
+                stale.map(id => `${accounts.find(a => a.id === id)?.name}(${reasons[id]})`).join(', '));
+            let cursor = 0;
+            const worker = async () => {
+                while (cursor < stale.length) {
+                    const i = cursor++;
+                    await handleRefreshOneRef.current(stale[i]).catch((e) => {
+                        console.warn(`[AutoRefresh] ${stale[i]} 刷新失败:`, e);
+                    });
+                }
+            };
+            for (let i = 0; i < Math.min(AUTO_CONCURRENCY, stale.length); i++) worker();
+        };
+
+        scan();
+        const t = setInterval(scan, 30_000);
+        return () => clearInterval(t);
+    }, [accounts]);
+
     // 搜索与过滤逻辑
     const filteredAccounts = useMemo(() => {
         let result = searchQuery
@@ -234,12 +290,27 @@ export function AccountList({
         }
     };
 
+    // 把 Tauri/后端原始报错翻译成人能看懂的一句话。
+    const humanizeRefreshError = (raw: string): string => {
+        const s = raw.toLowerCase();
+        if (s.includes('account_banned')) return '账号已被封禁';
+        if (s.includes('token_invalid')) return 'Token 已失效，需要重新登录';
+        if (s.includes('account_logged_out')) return '账号已登出，需要重新登录';
+        if (s.includes('timeout') || s.includes('timed out')) return '请求超时（OpenAI 端慢/被节流）';
+        if (s.includes('网络请求失败') || s.includes('network')) return '网络请求失败，检查代理/网络';
+        if (s.includes('刷新令牌') || s.includes('refresh')) return 'refresh_token 刷新失败';
+        if (s.includes('relay_account')) return '中转账号请用「中转余额刷新」';
+        if (raw.length > 160) return raw.slice(0, 160) + '…';
+        return raw;
+    };
+
     // 交互处理
     const handleRefreshOne = async (id: string) => {
         setRefreshingIds(prev => new Set(prev).add(id));
+        const acc = accounts.find(a => a.id === id);
+        const accName = acc?.name ?? id;
         try {
             // Relay 账号走专属 fetcher（不查 OpenAI usage）
-            const acc = accounts.find(a => a.id === id);
             if (acc && effectiveKind(acc) === 'relay') {
                 const cache = await invoke<RelayUsageCache>('refresh_relay_usage', { id });
                 setRelayUsageMap(prev => ({ ...prev, [id]: cache }));
@@ -259,16 +330,27 @@ export function AccountList({
             onRefreshComplete?.();
         } catch (err) {
             const errMsg = String(err);
+            // 仍然按错误类型标 UI 状态
             if (errMsg.includes('ACCOUNT_BANNED')) {
                 setBannedIds(prev => new Set(prev).add(id));
                 setInvalidIds(prev => new Set(prev).add(id));
             } else if (errMsg.includes('TOKEN_INVALID')) {
                 setInvalidIds(prev => new Set(prev).add(id));
             }
+            // 把错误 tip 出来，不再静默失败
+            setPushToast({
+                type: 'error',
+                text: `${accName} 刷新失败：${humanizeRefreshError(errMsg)}`,
+            });
+            setTimeout(() => setPushToast(null), 6000);
         } finally {
             setRefreshingIds(prev => { const n = new Set(prev); n.delete(id); return n; });
         }
     };
+
+    // 把最新的 handleRefreshOne 挂到 ref，让上面 reset 后自动刷新的 effect
+    // 不必把它放进依赖里反复重建。
+    handleRefreshOneRef.current = handleRefreshOne;
 
     const handleSaveUsageCookie = async () => {
         if (!cookieEditor) return;
@@ -457,7 +539,24 @@ export function AccountList({
                         <Gauge className={usageLoading ? 'spinning' : ''} size={16} />
                     </button>
                 )}
-                <button className="btn-refresh" onClick={() => { setIsRefreshingAll(true); Promise.all(filteredAccounts.map(a => handleRefreshOne(a.id))).finally(() => setIsRefreshingAll(false)); }}>
+                <button className="btn-refresh" onClick={() => {
+                    // 之前是 Promise.all 一把梭 — N 个账号同时打 OpenAI usage，
+                    // 一旦边缘节流单个账号要 10s+，整批的尾延迟会跟着慢账号走。
+                    // 改成并发上限 6 的滑动窗口：快账号先回，慢账号自然排队，
+                    // 既不雷霆万钧也不串行。
+                    const CONCURRENCY = 6;
+                    const ids = filteredAccounts.map(a => a.id);
+                    setIsRefreshingAll(true);
+                    let cursor = 0;
+                    const worker = async () => {
+                        while (cursor < ids.length) {
+                            const i = cursor++;
+                            await handleRefreshOne(ids[i]);
+                        }
+                    };
+                    const workers = Array.from({ length: Math.min(CONCURRENCY, ids.length) }, worker);
+                    Promise.all(workers).finally(() => setIsRefreshingAll(false));
+                }}>
                     <RefreshCw className={isRefreshingAll ? 'spinning' : ''} size={16} />
                 </button>
             </div>

@@ -252,11 +252,11 @@ export function useAccounts() {
         }
     }, []);
 
-    // 开始 OAuth 登录
-    const startOAuthLogin = useCallback(async () => {
+    // 开始 OAuth 登录；openBrowser=false 时只准备 URL + 启动监听，不打开默认浏览器
+    const startOAuthLogin = useCallback(async (openBrowser: boolean = true) => {
         try {
             setError(null);
-            return await invoke<string>('start_oauth_login');
+            return await invoke<string>('start_oauth_login', { openBrowser });
         } catch (err) {
             setError(String(err));
             throw err;
