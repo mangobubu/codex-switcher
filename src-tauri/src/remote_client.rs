@@ -13,7 +13,9 @@ use crate::account::Account;
 const AUTH_HEADER: &str = "X-Auth-Token";
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const PROBE_TIMEOUT_SECS: u64 = 2;
-const CACHE_TTL_SECS: u64 = 60;
+// 之前 60s：每分钟一次重探，破网情况下每分钟烧一次 2s LAN timeout（即便已经知道 LAN
+// 不通）。300s 折衷：缓存命中率高得多，路径切换（家 LAN 回到办公室 WiFi）也只要等 5 min。
+const CACHE_TTL_SECS: u64 = 300;
 
 struct UrlCache {
     url: String,
@@ -97,31 +99,76 @@ async fn probe(url: &str) -> bool {
     }
 }
 
-/// 从 primary 和 fallback 中挑一个可用地址，带 60s 缓存。
+/// 从 primary 和 fallback 中挑一个可用地址，带 300s 缓存。
+///
+/// 之前是「先串行探 primary（2s timeout）再 fallback」—— 用户网络切到不同子网时
+/// LAN 不通，每次缓存过期都白白卡 2s 才用上 ZT。改成 **并行探测**：两条都起，谁先
+/// 返 OK 用谁。最坏情况两条都坏，并行等到双方 timeout（仍是 2s 上限，比之前 4s 好）。
 pub async fn resolve_base_url(primary: &str, fallback: &str) -> Result<String, String> {
-    let p = primary.trim();
-    let f = fallback.trim();
+    let p = primary.trim().to_string();
+    let f = fallback.trim().to_string();
     if p.is_empty() && f.is_empty() {
         return Err("未配置 Server 地址".to_string());
     }
+    // 缓存命中：必须匹配当前配置（防止 settings 改完仍用旧 URL）
     if let Some(c) = cached_url() {
         if c == p || c == f {
             return Ok(c);
         }
     }
-    if !p.is_empty() && probe(p).await {
-        set_cached_url(p);
-        return Ok(p.to_string());
+    // 只配了一个的简单分支
+    if p.is_empty() {
+        if probe(&f).await {
+            set_cached_url(&f);
+            return Ok(f);
+        }
+        return Err(format!("Server 不可达（fallback={}）", f));
     }
-    if !f.is_empty() && probe(f).await {
-        set_cached_url(f);
-        return Ok(f.to_string());
+    if f.is_empty() {
+        if probe(&p).await {
+            set_cached_url(&p);
+            return Ok(p);
+        }
+        return Err(format!("Server 不可达（primary={}）", p));
     }
-    Err(format!(
-        "Server 不可达（primary={}, fallback={}）",
-        if p.is_empty() { "-" } else { p },
-        if f.is_empty() { "-" } else { f }
-    ))
+
+    // 双地址：并行探测，第一个返 OK 的赢。
+    // futures_util::select 要求 future 实现 Unpin，pin_mut 给堆栈固定。
+    use futures_util::{
+        future::{select, Either},
+        pin_mut,
+    };
+    let p_fut = async {
+        let ok = probe(&p).await;
+        (p.clone(), ok)
+    };
+    let f_fut = async {
+        let ok = probe(&f).await;
+        (f.clone(), ok)
+    };
+    pin_mut!(p_fut);
+    pin_mut!(f_fut);
+
+    let winner = match select(p_fut, f_fut).await {
+        Either::Left(((url, true), _)) => Some(url),
+        Either::Right(((url, true), _)) => Some(url),
+        // 先回来的那条失败了 —— 等另一条
+        Either::Left(((_, false), other)) => {
+            let (url, ok) = other.await;
+            if ok { Some(url) } else { None }
+        }
+        Either::Right(((_, false), other)) => {
+            let (url, ok) = other.await;
+            if ok { Some(url) } else { None }
+        }
+    };
+
+    if let Some(url) = winner {
+        set_cached_url(&url);
+        Ok(url)
+    } else {
+        Err(format!("Server 不可达（primary={}, fallback={}）", p, f))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
