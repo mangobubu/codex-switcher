@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge } from 'lucide-react';
+import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge, Eraser } from 'lucide-react';
 import { Account, AppSettings, RelayUsageCache, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -41,6 +41,14 @@ interface UsageData {
 }
 
 type FilterType = 'all' | 'sub' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
+type CleanupKind = 'unknown' | 'failed' | 'expired' | 'banned';
+
+const CLEANUP_OPTIONS: Array<{ key: CleanupKind; label: string; description: string }> = [
+    { key: 'unknown', label: '未知账号', description: 'ChatGPT 订阅号未拿到 plan，或 plan 为 unknown' },
+    { key: 'failed', label: '失败账号', description: '保活/刷新有错误，但尚未判定为过期或封禁' },
+    { key: 'expired', label: '过期账号', description: 'Token 失效、已登出，或 CLI 校验不可用' },
+    { key: 'banned', label: '封禁账号', description: '已被标记为封禁的账号' },
+];
 
 interface AccountListProps {
     accounts: Account[];
@@ -83,6 +91,13 @@ export function AccountList({
     const [bannedIds, setBannedIds] = useState<Set<string>>(new Set());
     const [accountToDelete, setAccountToDelete] = useState<{ id: string, name: string } | null>(null);
     const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
+    const [showCleanupConfirm, setShowCleanupConfirm] = useState(false);
+    const [cleanupKinds, setCleanupKinds] = useState<Record<CleanupKind, boolean>>({
+        unknown: true,
+        failed: true,
+        expired: true,
+        banned: true,
+    });
     const [bulkDeleting, setBulkDeleting] = useState(false);
     const [pushingIds, setPushingIds] = useState<Set<string>>(new Set());
     const [pushToast, setPushToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -97,6 +112,59 @@ export function AccountList({
         () => accounts.filter(a => selectedIds.has(a.id)),
         [accounts, selectedIds]
     );
+    const cleanupBuckets = useMemo(() => {
+        const buckets: Record<CleanupKind, Account[]> = {
+            unknown: [],
+            failed: [],
+            expired: [],
+            banned: [],
+        };
+
+        accounts.forEach(acc => {
+            const err = (acc.keepalive?.last_error || '').toLowerCase();
+            const hasPermanentError = /reused|invalidated|expired/.test(err);
+            const isBanned = acc.is_banned || bannedIds.has(acc.id);
+            const isExpired = !isBanned && (
+                acc.is_token_invalid ||
+                acc.is_logged_out ||
+                invalidIds.has(acc.id) ||
+                acc.cached_quota?.is_valid_for_cli === false ||
+                usageMap[acc.id]?.is_valid_for_cli === false ||
+                hasPermanentError
+            );
+            const isFailed = !isBanned && !isExpired && !!err;
+            const plan = (usageMap[acc.id]?.plan_type || acc.cached_quota?.plan_type || '').trim().toLowerCase();
+            const isUnknown = !isBanned &&
+                !isExpired &&
+                !isFailed &&
+                effectiveKind(acc) === 'chatgpt_oauth' &&
+                (!plan || plan === 'unknown');
+
+            if (isUnknown) buckets.unknown.push(acc);
+            if (isFailed) buckets.failed.push(acc);
+            if (isExpired) buckets.expired.push(acc);
+            if (isBanned) buckets.banned.push(acc);
+        });
+
+        return buckets;
+    }, [accounts, bannedIds, invalidIds, usageMap]);
+    const cleanupAccounts = useMemo(() => {
+        const result: Account[] = [];
+        const seen = new Set<string>();
+
+        CLEANUP_OPTIONS.forEach(({ key }) => {
+            if (!cleanupKinds[key]) return;
+            cleanupBuckets[key].forEach(acc => {
+                if (seen.has(acc.id)) return;
+                seen.add(acc.id);
+                result.push(acc);
+            });
+        });
+
+        return result;
+    }, [cleanupBuckets, cleanupKinds]);
+    const cleanupCandidateCount = CLEANUP_OPTIONS.reduce((sum, option) => sum + cleanupBuckets[option.key].length, 0);
+    const cleanupSelectionCount = CLEANUP_OPTIONS.filter(option => cleanupKinds[option.key]).length;
 
     const handleCopy = (id: string, text: string) => {
         navigator.clipboard.writeText(text).then(() => {
@@ -412,6 +480,21 @@ export function AccountList({
         }
     };
 
+    const handleCleanupDelete = async () => {
+        if (!onBulkDelete || cleanupAccounts.length === 0) return;
+        setBulkDeleting(true);
+        try {
+            await onBulkDelete(cleanupAccounts.map(acc => acc.id));
+            setSelectedIds(new Set());
+            setShowCleanupConfirm(false);
+        } catch (e) {
+            setPushToast({ type: 'error', text: `清理账号失败: ${e}` });
+            setTimeout(() => setPushToast(null), 5000);
+        } finally {
+            setBulkDeleting(false);
+        }
+    };
+
     /// Relay 余额展示：
     /// - unit 是 `%` → 进度条 mini-card（GLM 这种百分比模型）
     /// - 其它（USD/CNY 等金额） → 纯文本 mini-card（unity2 等返回金额的）
@@ -573,6 +656,16 @@ export function AccountList({
                         title="刷新所有账号配额"
                     >
                         <Gauge className={usageLoading ? 'spinning' : ''} size={16} />
+                    </button>
+                )}
+                {onBulkDelete && (
+                    <button
+                        className="toolbar-icon-btn toolbar-icon-btn-cleanup"
+                        onClick={() => setShowCleanupConfirm(true)}
+                        disabled={bulkDeleting || cleanupCandidateCount === 0}
+                        title={cleanupCandidateCount > 0 ? `按状态清理 ${cleanupCandidateCount} 个账号` : '没有可清理账号'}
+                    >
+                        <Eraser size={16} />
                     </button>
                 )}
                 {onBulkDelete && selectedAccounts.length > 0 && (
@@ -784,6 +877,72 @@ export function AccountList({
                 onCancel={() => !bulkDeleting && setShowBulkDeleteConfirm(false)}
                 isLoading={bulkDeleting}
                 loadingText="删除中..."
+            />
+            <ConfirmModal
+                isOpen={showCleanupConfirm}
+                title="按状态清理账号"
+                message={
+                    <div>
+                        <p>
+                            勾选要清理的账号状态。清理会永久删除账号管理里的记录，但不会删除或清空 <code>~/.codex/auth.json</code>。
+                        </p>
+                        <div className="cleanup-options">
+                            {CLEANUP_OPTIONS.map(option => {
+                                const count = cleanupBuckets[option.key].length;
+                                const checked = cleanupKinds[option.key];
+                                return (
+                                    <label
+                                        key={option.key}
+                                        className={`cleanup-option ${checked ? 'selected' : ''} ${count === 0 ? 'empty' : ''}`}
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            className="custom-checkbox"
+                                            checked={checked}
+                                            disabled={bulkDeleting}
+                                            onChange={() => {
+                                                setCleanupKinds(prev => ({
+                                                    ...prev,
+                                                    [option.key]: !prev[option.key],
+                                                }));
+                                            }}
+                                        />
+                                        <span className="cleanup-option-main">
+                                            <span className="cleanup-option-label">{option.label}</span>
+                                            <span className="cleanup-option-desc">{option.description}</span>
+                                        </span>
+                                        <span className="cleanup-option-count">{count}</span>
+                                    </label>
+                                );
+                            })}
+                        </div>
+                        <div className="cleanup-summary">
+                            将清理 <strong>{cleanupAccounts.length}</strong> 个账号
+                        </div>
+                        {cleanupAccounts.length > 0 ? (
+                            <div className="bulk-delete-preview">
+                                {cleanupAccounts.slice(0, 5).map(acc => (
+                                    <div key={acc.id} className="bulk-delete-preview-item">{acc.name}</div>
+                                ))}
+                                {cleanupAccounts.length > 5 && (
+                                    <div className="bulk-delete-preview-more">
+                                        还有 {cleanupAccounts.length - 5} 个账号
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <p className="bulk-delete-note">
+                                {cleanupSelectionCount === 0 ? '至少选择一种状态。' : '当前选择没有命中的账号。'}
+                            </p>
+                        )}
+                    </div>
+                }
+                confirmText={cleanupAccounts.length > 0 ? `清理 ${cleanupAccounts.length} 个账号` : '无可清理账号'}
+                onConfirm={handleCleanupDelete}
+                onCancel={() => !bulkDeleting && setShowCleanupConfirm(false)}
+                isLoading={bulkDeleting}
+                loadingText="清理中..."
+                confirmDisabled={cleanupAccounts.length === 0 || cleanupSelectionCount === 0}
             />
             {cookieEditor && (
                 <div className="modal-overlay" onClick={() => !savingCookie && setCookieEditor(null)}>

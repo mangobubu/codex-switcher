@@ -12,6 +12,7 @@ interface ConfirmModalProps {
     loadingText?: string;
     extraActionText?: string;
     onExtraAction?: () => void;
+    confirmDisabled?: boolean;
 }
 
 export function ConfirmModal({
@@ -26,6 +27,7 @@ export function ConfirmModal({
     loadingText = '正在切换...',
     extraActionText,
     onExtraAction,
+    confirmDisabled = false,
 }: ConfirmModalProps) {
     if (!isOpen) return null;
 
@@ -50,7 +52,7 @@ export function ConfirmModal({
                             {extraActionText}
                         </button>
                     )}
-                    <button className="btn-confirm" onClick={onConfirm} disabled={isLoading}>
+                    <button className="btn-confirm" onClick={onConfirm} disabled={isLoading || confirmDisabled}>
                         {isLoading ? loadingText : confirmText}
                     </button>
                 </div>

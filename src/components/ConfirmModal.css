@@ -18,6 +18,7 @@
     border-radius: 12px;
     width: 400px;
     max-width: 90vw;
+    max-height: 90vh;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
     border: 1px solid var(--border-color);
     animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
@@ -27,6 +28,7 @@
 
 .confirm-header {
     padding: 24px 24px 0;
+    flex-shrink: 0;
 }
 
 .confirm-icon {
@@ -50,6 +52,8 @@
     font-size: 14px;
     line-height: 1.6;
     text-align: center;
+    overflow-y: auto;
+    min-height: 0;
 }
 
 .confirm-account-name {
@@ -71,6 +75,7 @@
     display: flex;
     justify-content: flex-end;
     gap: 12px;
+    flex-shrink: 0;
 }
 
 .btn-confirm {
@@ -89,6 +94,13 @@
     transform: translateY(-1px);
 }
 
+.btn-confirm:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    transform: none;
+    filter: none;
+}
+
 .btn-cancel {
     background: transparent;
     border: 1px solid var(--border-color);
@@ -102,6 +114,11 @@
 .btn-cancel:hover {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+}
+
+.btn-cancel:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
 }
 
 @keyframes fadeIn {

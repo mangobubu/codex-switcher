@@ -255,6 +255,18 @@
     filter: brightness(1.08);
 }
 
+.toolbar-icon-btn-cleanup {
+    color: #f59e0b;
+    border-color: rgba(245, 158, 11, 0.45);
+    background: rgba(245, 158, 11, 0.10);
+}
+
+.toolbar-icon-btn-cleanup:hover:not(:disabled) {
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.18);
+    border-color: rgba(245, 158, 11, 0.65);
+}
+
 /* 自定义复选框 */
 .custom-checkbox {
     appearance: none;
@@ -756,6 +768,79 @@
     margin: 0;
     font-size: 12px;
     color: var(--text-muted);
+}
+
+.cleanup-options {
+    display: grid;
+    gap: 8px;
+    margin: 14px 0;
+}
+
+.cleanup-option {
+    display: grid;
+    grid-template-columns: 24px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--input-bg);
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.cleanup-option:hover {
+    border-color: rgba(245, 158, 11, 0.45);
+    background: var(--hover-bg);
+}
+
+.cleanup-option.selected {
+    border-color: rgba(245, 158, 11, 0.55);
+    background: rgba(245, 158, 11, 0.10);
+}
+
+.cleanup-option.empty {
+    opacity: 0.72;
+}
+
+.cleanup-option-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    gap: 2px;
+}
+
+.cleanup-option-label {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.cleanup-option-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
+.cleanup-option-count {
+    min-width: 28px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: var(--badge-bg);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 700;
+    text-align: center;
+}
+
+.cleanup-summary {
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.cleanup-summary strong {
+    color: var(--danger-color);
 }
 
 /* 刷新按钮 */
