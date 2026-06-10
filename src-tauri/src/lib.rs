@@ -946,6 +946,7 @@ fn update_relay_model_map(
 #[tauri::command]
 async fn refresh_relay_usage(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     id: String,
 ) -> Result<account::RelayUsageCache, String> {
     let (base_url, api_key, preset, usage_cookie) = {
@@ -1006,6 +1007,7 @@ async fn refresh_relay_usage(
             store.save()?;
         }
     }
+    let _ = app.emit("accounts-updated", ());
     Ok(cache)
 }
 
@@ -2816,7 +2818,7 @@ fn check_codex_login() -> Result<bool, String> {
 #[tauri::command]
 async fn get_quota_by_id(
     state: tauri::State<'_, AppState>,
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     id: String,
 ) -> Result<UsageDisplay, String> {
     // Relay 账号：不走 OpenAI usage 路径
@@ -3074,6 +3076,7 @@ async fn get_quota_by_id(
         store.save()?;
     }
 
+    let _ = app.emit("accounts-updated", ());
     Ok(usage)
 }
 
