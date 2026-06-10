@@ -2,7 +2,7 @@ name: Release
 on:
   push:
     tags:
-      - "v0.7.5"
+      - "v0.7.4"
   workflow_dispatch:
 
 jobs:
@@ -15,10 +15,13 @@ jobs:
         include:
           - platform: "macos-latest"
             args: "--target aarch64-apple-darwin"
-          - platform: "macos-latest"
+            arch: "aarch64"
+          - platform: "macos-15-intel"
             args: "--target x86_64-apple-darwin"
+            arch: "x64"
           - platform: "macos-latest"
             args: "--target universal-apple-darwin"
+            arch: "universal"
           - platform: "ubuntu-22.04"
             args: ""
           - platform: "windows-latest"
@@ -39,7 +42,7 @@ jobs:
       - name: Rust setup
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ startsWith(matrix.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Node.js setup
         uses: actions/setup-node@v4
@@ -56,18 +59,9 @@ jobs:
         run: npm run tauri build -- ${{ matrix.args }}
 
       - name: Rename macOS assets for architecture
-        if: matrix.platform == 'macos-latest'
+        if: startsWith(matrix.platform, 'macos')
         run: |
-          if [[ "${{ matrix.args }}" == *"--target aarch64-apple-darwin"* ]]; then
-            ARCH="aarch64"
-          elif [[ "${{ matrix.args }}" == *"--target x86_64-apple-darwin"* ]]; then
-            ARCH="x64"
-          elif [[ "${{ matrix.args }}" == *"--target universal-apple-darwin"* ]]; then
-            ARCH="universal"
-          else
-            ARCH="unknown"
-          fi
-
+          ARCH="${{ matrix.arch }}"
           echo "Detected architecture: $ARCH"
           cd src-tauri/target/*/release/bundle/macos/
 
