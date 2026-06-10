@@ -1,9 +1,16 @@
 use tauri::{
     image::Image,
-    tray::{TrayIcon, TrayIconBuilder, TrayIconEvent},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     webview::WebviewWindowBuilder,
     AppHandle, Manager,
 };
+
+const POPUP_WIDTH: f64 = 380.0;
+const POPUP_HEIGHT: f64 = 410.0;
+const POPUP_MARGIN: f64 = 8.0;
+const TRAY_MENU_SHOW: &str = "show_main_window";
+const TRAY_MENU_QUIT: &str = "quit_app";
 
 /// 初始化系统托盘
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -32,19 +39,30 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     let (width, height) = final_img.dimensions();
     let icon = Image::new_owned(final_img.into_raw(), width, height);
+    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW, "打开主窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出应用", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
 
     let _tray = TrayIconBuilder::with_id("main")
         .icon(icon)
         .icon_as_template(false)
+        .menu(&menu)
         .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_MENU_SHOW => show_main_window_from_cmd(app),
+            TRAY_MENU_QUIT => app.exit(0),
+            _ => {}
+        })
         .on_tray_icon_event(|tray: &TrayIcon, event: TrayIconEvent| {
             if let TrayIconEvent::Click {
-                button_state: tauri::tray::MouseButtonState::Up,
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
                 position,
                 ..
             } = event
             {
-                // 任意点击 → 弹出 popup
+                // 左键点击 → 弹出 popup；右键保留给系统菜单。
                 toggle_popup(tray.app_handle(), position);
             }
         })
@@ -72,14 +90,11 @@ fn toggle_popup(app: &AppHandle, position: tauri::PhysicalPosition<f64>) {
     }
 
     // 首次创建
-    let popup_width = 380.0;
-    let popup_height = 410.0;
-
     let url = tauri::WebviewUrl::App("index.html".into());
 
     match WebviewWindowBuilder::new(app, label, url)
         .title("Codex Switcher")
-        .inner_size(popup_width, popup_height)
+        .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
         .resizable(false)
         .decorations(false)
         .transparent(true)
@@ -111,16 +126,72 @@ fn position_popup(
     win: &tauri::WebviewWindow,
     tray_pos: tauri::PhysicalPosition<f64>,
 ) -> Result<(), String> {
-    let popup_width = 380.0;
+    let monitor = win
+        .available_monitors()
+        .ok()
+        .and_then(|monitors| {
+            monitors.into_iter().find(|monitor| {
+                let pos = monitor.position();
+                let size = monitor.size();
+                let left = pos.x as f64;
+                let top = pos.y as f64;
+                let right = left + size.width as f64;
+                let bottom = top + size.height as f64;
 
-    let scale = win.scale_factor().unwrap_or(1.0);
+                tray_pos.x >= left
+                    && tray_pos.x <= right
+                    && tray_pos.y >= top
+                    && tray_pos.y <= bottom
+            })
+        })
+        .or_else(|| win.current_monitor().ok().flatten());
 
-    let x = (tray_pos.x - popup_width * scale / 2.0).max(0.0) as i32;
-    let y = (tray_pos.y + 4.0) as i32; // 留一点间距给菜单栏
+    let scale = monitor
+        .as_ref()
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or_else(|| win.scale_factor().unwrap_or(1.0));
+    let popup_width = POPUP_WIDTH * scale;
+    let popup_height = POPUP_HEIGHT * scale;
+    let margin = POPUP_MARGIN * scale;
 
-    let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
-        x, y,
-    )));
+    let (left, top, right, bottom) = monitor
+        .map(|monitor| {
+            let area = monitor.work_area();
+            let left = area.position.x as f64;
+            let top = area.position.y as f64;
+            let right = left + area.size.width as f64;
+            let bottom = top + area.size.height as f64;
+            (left, top, right, bottom)
+        })
+        .unwrap_or((0.0, 0.0, f64::INFINITY, f64::INFINITY));
+
+    let max_x = right - popup_width;
+    let x = if max_x < left {
+        left
+    } else {
+        (tray_pos.x - popup_width / 2.0).clamp(left, max_x)
+    };
+
+    let below_y = tray_pos.y + margin;
+    let above_y = tray_pos.y - popup_height - margin;
+    let popup_y = if below_y + popup_height <= bottom {
+        below_y
+    } else if above_y >= top {
+        above_y
+    } else {
+        let max_y = bottom - popup_height;
+        if max_y < top {
+            top
+        } else {
+            max_y
+        }
+    };
+
+    win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+        x.round() as i32,
+        popup_y.round() as i32,
+    )))
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

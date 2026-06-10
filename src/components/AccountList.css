@@ -244,6 +244,17 @@
     filter: brightness(1.1);
 }
 
+.toolbar-icon-btn-danger {
+    background: var(--danger-color);
+    color: #fff;
+    border-color: var(--danger-color);
+}
+
+.toolbar-icon-btn-danger:hover {
+    color: #fff;
+    filter: brightness(1.08);
+}
+
 /* 自定义复选框 */
 .custom-checkbox {
     appearance: none;
@@ -717,6 +728,34 @@
 .selected-info {
     color: var(--primary-color);
     font-weight: 500;
+}
+
+.bulk-delete-preview {
+    margin: 12px 0;
+    padding: 8px;
+    background: var(--input-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+}
+
+.bulk-delete-preview-item,
+.bulk-delete-preview-more {
+    padding: 4px 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.bulk-delete-preview-more {
+    color: var(--text-muted);
+}
+
+.bulk-delete-note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-muted);
 }
 
 /* 刷新按钮 */

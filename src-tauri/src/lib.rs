@@ -530,6 +530,83 @@ async fn delete_account(
     Ok(())
 }
 
+/// 批量删除账号
+#[tauri::command]
+async fn delete_accounts(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    let mut ids: Vec<String> = ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let (remote_mode, primary, fallback, secret) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        (
+            store.settings.remote_mode.clone(),
+            store.settings.remote_server_url.clone(),
+            store.settings.remote_server_url_fallback.clone(),
+            store.settings.remote_shared_secret.clone(),
+        )
+    };
+
+    {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        let missing: Vec<String> = ids
+            .iter()
+            .filter(|id| !store.accounts.contains_key(id.as_str()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!("账号不存在: {}", missing.join(", ")));
+        }
+
+        if store
+            .current
+            .as_deref()
+            .map(|current| ids.iter().any(|id| id == current))
+            .unwrap_or(false)
+        {
+            store.current = None;
+        }
+
+        for id in &ids {
+            store.delete_account(id)?;
+        }
+        store.save()?;
+    }
+
+    // 与单删保持一致：client / solo 模式同步删除 Server 上的对应账号。
+    // 不删除 ~/.codex/auth.json，也不扫描或移除任何额外 JSON 文件。
+    if account::pushes_to_server(&remote_mode) && !secret.is_empty() {
+        match remote_client::resolve_base_url(&primary, &fallback).await {
+            Ok(base) => {
+                for id in &ids {
+                    if let Err(e) = remote_client::delete_account(&base, &secret, id).await {
+                        eprintln!(
+                            "[DeleteAccounts] Server 端联动删除失败（本地已删除，id={}）: {}",
+                            id, e
+                        );
+                    }
+                }
+            }
+            Err(e) => eprintln!("[DeleteAccounts] Server 不可达（本地已删除）: {}", e),
+        }
+    }
+
+    crate::tray::update_tray_menu(&app);
+    Ok(())
+}
+
 /// 更新账号信息
 #[tauri::command]
 fn update_account(
@@ -5134,6 +5211,7 @@ pub fn run() {
             switch_account,
             sync_current_auth_to_account,
             delete_account,
+            delete_accounts,
             update_account,
             update_relay_usage_cookie,
             set_account_inactive_refresh_enabled,

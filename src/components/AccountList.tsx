@@ -48,6 +48,7 @@ interface AccountListProps {
     settings: AppSettings;
     onSwitch: (id: string) => void | Promise<void>;
     onDelete: (id: string) => void;
+    onBulkDelete?: (ids: string[]) => void | Promise<void>;
     onUpdateSettings: (settings: AppSettings) => void;
     onRefreshComplete?: () => void;
     onAddAccount?: () => void;
@@ -66,6 +67,7 @@ export function AccountList({
     onRefreshUsage,
     usageLoading,
     onDelete,
+    onBulkDelete,
     onUpdateSettings,
     onRefreshComplete,
 }: AccountListProps) {
@@ -80,6 +82,8 @@ export function AccountList({
     const [invalidIds, setInvalidIds] = useState<Set<string>>(new Set());
     const [bannedIds, setBannedIds] = useState<Set<string>>(new Set());
     const [accountToDelete, setAccountToDelete] = useState<{ id: string, name: string } | null>(null);
+    const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
+    const [bulkDeleting, setBulkDeleting] = useState(false);
     const [pushingIds, setPushingIds] = useState<Set<string>>(new Set());
     const [pushToast, setPushToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     // Relay 类型账号的余额缓存（与 ChatGPT usage 独立）
@@ -89,6 +93,10 @@ export function AccountList({
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
+    const selectedAccounts = useMemo(
+        () => accounts.filter(a => selectedIds.has(a.id)),
+        [accounts, selectedIds]
+    );
 
     const handleCopy = (id: string, text: string) => {
         navigator.clipboard.writeText(text).then(() => {
@@ -135,6 +143,19 @@ export function AccountList({
         setRelayUsageMap(prev => ({ ...prev, ...initialRelayUsage }));
         setInvalidIds(initialInvalids);
         setBannedIds(initialBanned);
+        setSelectedIds(prev => {
+            const validIds = new Set(accounts.map(acc => acc.id));
+            const next = new Set<string>();
+            let changed = false;
+            prev.forEach(id => {
+                if (validIds.has(id)) {
+                    next.add(id);
+                } else {
+                    changed = true;
+                }
+            });
+            return changed ? next : prev;
+        });
     }, [accounts]);
 
     // 自动 reset 后重拉：cached 数据老于 reset_at 时窗口已经重置但缓存还是旧的 0%，
@@ -376,6 +397,21 @@ export function AccountList({
         }
     };
 
+    const handleBulkDelete = async () => {
+        if (!onBulkDelete || selectedAccounts.length === 0) return;
+        setBulkDeleting(true);
+        try {
+            await onBulkDelete(selectedAccounts.map(acc => acc.id));
+            setSelectedIds(new Set());
+            setShowBulkDeleteConfirm(false);
+        } catch (e) {
+            setPushToast({ type: 'error', text: `批量删除失败: ${e}` });
+            setTimeout(() => setPushToast(null), 5000);
+        } finally {
+            setBulkDeleting(false);
+        }
+    };
+
     /// Relay 余额展示：
     /// - unit 是 `%` → 进度条 mini-card（GLM 这种百分比模型）
     /// - 其它（USD/CNY 等金额） → 纯文本 mini-card（unity2 等返回金额的）
@@ -539,6 +575,16 @@ export function AccountList({
                         <Gauge className={usageLoading ? 'spinning' : ''} size={16} />
                     </button>
                 )}
+                {onBulkDelete && selectedAccounts.length > 0 && (
+                    <button
+                        className="toolbar-icon-btn toolbar-icon-btn-danger"
+                        onClick={() => setShowBulkDeleteConfirm(true)}
+                        disabled={bulkDeleting}
+                        title={`删除已选 ${selectedAccounts.length} 个账号`}
+                    >
+                        <Trash2 size={16} />
+                    </button>
+                )}
                 <button className="btn-refresh" onClick={() => {
                     // 之前是 Promise.all 一把梭 — N 个账号同时打 OpenAI usage，
                     // 一旦边缘节流单个账号要 10s+，整批的尾延迟会跟着慢账号走。
@@ -700,7 +746,7 @@ export function AccountList({
             <ConfirmModal
                 isOpen={!!accountToDelete}
                 title="确认删除账号"
-                message={<p>确定要永久删除账号 <strong>{accountToDelete?.name}</strong> 吗？<br /><br />此操作不可恢复，删除后有关该账号的本地授权信息将被清除。</p>}
+                message={<p>确定要永久删除账号 <strong>{accountToDelete?.name}</strong> 吗？<br /><br />此操作只会从账号管理中移除此账号，不会删除或清空 ~/.codex/auth.json。</p>}
                 confirmText="彻底删除"
                 onConfirm={() => {
                     if (accountToDelete) {
@@ -709,6 +755,35 @@ export function AccountList({
                     }
                 }}
                 onCancel={() => setAccountToDelete(null)}
+            />
+            <ConfirmModal
+                isOpen={showBulkDeleteConfirm}
+                title="确认批量删除"
+                message={
+                    <div>
+                        <p>
+                            确定要永久删除已选的 <strong>{selectedAccounts.length}</strong> 个账号吗？
+                        </p>
+                        <div className="bulk-delete-preview">
+                            {selectedAccounts.slice(0, 5).map(acc => (
+                                <div key={acc.id} className="bulk-delete-preview-item">{acc.name}</div>
+                            ))}
+                            {selectedAccounts.length > 5 && (
+                                <div className="bulk-delete-preview-more">
+                                    还有 {selectedAccounts.length - 5} 个账号
+                                </div>
+                            )}
+                        </div>
+                        <p className="bulk-delete-note">
+                            此操作只删除账号管理里的对应账号记录，不会删除或清空 ~/.codex/auth.json。
+                        </p>
+                    </div>
+                }
+                confirmText="删除已选"
+                onConfirm={handleBulkDelete}
+                onCancel={() => !bulkDeleting && setShowBulkDeleteConfirm(false)}
+                isLoading={bulkDeleting}
+                loadingText="删除中..."
             />
             {cookieEditor && (
                 <div className="modal-overlay" onClick={() => !savingCookie && setCookieEditor(null)}>

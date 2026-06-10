@@ -33,6 +33,7 @@ function App() {
     importCurrent,
     switchTo,
     deleteAccount,
+    deleteAccounts,
     exportAccounts,
     reloadIdeWindows,
     updateSettings,
@@ -433,6 +434,7 @@ function App() {
             settings={settings}
             onSwitch={handleSwitch}
             onDelete={deleteAccount}
+            onBulkDelete={deleteAccounts}
             onUpdateSettings={updateSettings}
             onRefreshComplete={refresh}
             onAddAccount={() => setShowAddModal(true)}

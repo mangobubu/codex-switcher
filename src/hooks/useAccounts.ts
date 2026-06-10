@@ -210,6 +210,20 @@ export function useAccounts() {
         }
     }, [loadData, currentId]);
 
+    const deleteAccounts = useCallback(async (ids: string[]) => {
+        try {
+            setError(null);
+            if (currentId && ids.includes(currentId)) {
+                setCurrentId(null);
+            }
+            await invoke('delete_accounts', { ids });
+            await loadData();
+        } catch (err) {
+            setError(String(err));
+            throw err;
+        }
+    }, [loadData, currentId]);
+
     // 更新账号
     const updateAccount = useCallback(async (id: string, name?: string, notes?: string) => {
         try {
@@ -298,6 +312,7 @@ export function useAccounts() {
         importCurrent,
         switchTo,
         deleteAccount,
+        deleteAccounts,
         updateAccount,
         exportAccounts,
         importAccounts,
