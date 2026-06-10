@@ -481,7 +481,6 @@ async fn resolve_token_with_affinity(
                 routes.record_hit(&route_id);
                 let _ = routes.save();
                 drop(routes);
-                let is_chatgpt = token.starts_with("eyJ");
                 println!("[Proxy] Hard route hit: {} → {}", sk, name);
                 Some((token, account_id, name))
             } else {
@@ -1326,7 +1325,12 @@ async fn handle_request(
     let (remote_mode, client_direct_upstream) = state
         .store
         .lock()
-        .map(|s| (s.settings.remote_mode.clone(), s.settings.client_direct_upstream))
+        .map(|s| {
+            (
+                s.settings.remote_mode.clone(),
+                s.settings.client_direct_upstream,
+            )
+        })
         .unwrap_or((String::new(), false));
 
     // client_direct_upstream=true：HTTP 也走"本机直连上游"（跟 WS 同路）；
@@ -1581,18 +1585,29 @@ async fn handle_request(
                 SilentRefreshOutcome::LoggedOut
                 | SilentRefreshOutcome::OtherError(_)
                 | SilentRefreshOutcome::NoRefreshToken => {
-                    let (mark_field, log_tag): (&str, &str) = match &outcome {
-                        SilentRefreshOutcome::LoggedOut => ("logged_out", "账号已登出/RT 被轮换"),
-                        SilentRefreshOutcome::NoRefreshToken => {
-                            ("token_invalid", "缺 refresh_token 无法刷新")
+                    let (mark_field, log_tag, detail): (&str, &str, Option<&str>) = match &outcome {
+                        SilentRefreshOutcome::LoggedOut => {
+                            ("logged_out", "账号已登出/RT 被轮换", None)
                         }
-                        SilentRefreshOutcome::OtherError(_) => ("token_invalid", "刷新失败"),
+                        SilentRefreshOutcome::NoRefreshToken => {
+                            ("token_invalid", "缺 refresh_token 无法刷新", None)
+                        }
+                        SilentRefreshOutcome::OtherError(e) => {
+                            ("token_invalid", "刷新失败", Some(e.as_str()))
+                        }
                         _ => unreachable!(),
                     };
-                    println!(
-                        "[Proxy] silent_refresh 不可恢复（{}），标记 + 切号",
-                        log_tag
-                    );
+                    if let Some(detail) = detail {
+                        println!(
+                            "[Proxy] silent_refresh 不可恢复（{}: {}），标记 + 切号",
+                            log_tag, detail
+                        );
+                    } else {
+                        println!(
+                            "[Proxy] silent_refresh 不可恢复（{}），标记 + 切号",
+                            log_tag
+                        );
+                    }
                     if let Ok(mut store) = state.store.lock() {
                         if let Some(current_id) = store.current.clone() {
                             if let Some(acc) = store.accounts.get_mut(&current_id) {
@@ -1642,11 +1657,17 @@ async fn handle_request(
         let body_bytes = serde_json::to_vec(&friendly).unwrap_or(resp_bytes.to_vec());
         eprintln!(
             "[Proxy] 401/403 链路完全失败，原始上游 body 前 200 字符: {}",
-            String::from_utf8_lossy(&resp_bytes).chars().take(200).collect::<String>()
+            String::from_utf8_lossy(&resp_bytes)
+                .chars()
+                .take(200)
+                .collect::<String>()
         );
         let _ = state.app_handle.emit(
             "proxy-account-failed",
-            &format!("账号「{}」401/限额耗尽，切号链失败", triggering_account_name),
+            &format!(
+                "账号「{}」401/限额耗尽，切号链失败",
+                triggering_account_name
+            ),
         );
         return Ok(Response::builder()
             .status(status_code.as_u16())
@@ -2122,8 +2143,19 @@ async fn try_remote_switch_and_retry(
                 return None;
             }
         };
+        if outcome.stale {
+            eprintln!(
+                "[Proxy] Server switch 已过期: reason={} current={}",
+                outcome.reason.as_deref().unwrap_or("unknown"),
+                outcome.current.as_deref().unwrap_or("(none)")
+            );
+        }
         if outcome.exhausted {
-            eprintln!("[Proxy] Server 告知无可用账号，停止重试");
+            let reset_hint = outcome
+                .earliest_reset_at
+                .map(|ts| format!("，earliest_reset_at={}", ts))
+                .unwrap_or_default();
+            eprintln!("[Proxy] Server 告知无可用账号，停止重试{}", reset_hint);
             return None;
         }
         let Some(new_current) = outcome.current.clone() else {
@@ -2223,7 +2255,10 @@ async fn adopt_remote_current(
     let auth_to_write = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
         store.sync_account_from_auth_json(new_id, t.auth_json.clone());
-        let auth = store.accounts.get(new_id).map(|acc| acc.to_codex_auth_value());
+        let auth = store
+            .accounts
+            .get(new_id)
+            .map(|acc| acc.to_codex_auth_value());
         store.current = Some(new_id.to_string());
         let _ = store.save();
         auth
@@ -2424,7 +2459,9 @@ fn restore_current_if_flagged(state: &ProxyState, entry_id: Option<&str>) {
         } else {
             let _ = store.save();
             invalidate_remote_token_cache();
-            let _ = state.app_handle.emit("proxy-account-switched", &target_name);
+            let _ = state
+                .app_handle
+                .emit("proxy-account-switched", &target_name);
             let _ = state.app_handle.emit("accounts-updated", ());
         }
     } else {
@@ -2661,8 +2698,7 @@ async fn forward_to_server_with_silent_retry(
 
         // 不限额，或最后一次尝试 —— 把 first_chunk 当 prefix，剩余 stream 续上
         let rest = stream.boxed();
-        let resp =
-            build_stream_response_from_parts(status, headers, first_chunk, rest, None, None);
+        let resp = build_stream_response_from_parts(status, headers, first_chunk, rest, None, None);
         if is_rate_limit {
             println!(
                 "[Proxy] silent_retry: max_retries={} 用完仍限额，把最后一次响应透回 codex",
@@ -2699,6 +2735,20 @@ async fn call_remote_switch_silently(state: &ProxyState) -> Result<(), String> {
         "silent retry: client HTTP usage_limit_reached",
     )
     .await?;
+    if outcome.stale {
+        println!(
+            "[Proxy] silent_retry: Server switch 已过期 reason={} current={}",
+            outcome.reason.as_deref().unwrap_or("unknown"),
+            outcome.current.as_deref().unwrap_or("(none)")
+        );
+    }
+    if outcome.exhausted {
+        let reset_hint = outcome
+            .earliest_reset_at
+            .map(|ts| format!("，earliest_reset_at={}", ts))
+            .unwrap_or_default();
+        println!("[Proxy] silent_retry: Server 已无可用账号{}", reset_hint);
+    }
     if outcome.switched {
         println!(
             "[Proxy] silent_retry: Server 已切到 {} ({})",
@@ -2906,11 +2956,6 @@ fn classify_sse_error(buf: &[u8]) -> SseErrorClass {
         return SseErrorClass::GlobalCapacity;
     }
     SseErrorClass::None
-}
-
-/// 兼容老调用：任何 limit/capacity 信号都返回 true
-fn sse_buf_has_rate_limit(buf: &[u8]) -> bool {
-    !matches!(classify_sse_error(buf), SseErrorClass::None)
 }
 
 fn sse_buf_has_banned(buf: &[u8]) -> bool {
@@ -3434,7 +3479,22 @@ async fn acquire_replacement_upstream(
             crate::remote_client::request_switch(&base, &secret, current_id.as_deref(), label)
                 .await
                 .ok()?;
+        if outcome.stale {
+            eprintln!(
+                "[Proxy] client stream retry: Server switch 已过期 reason={} current={}",
+                outcome.reason.as_deref().unwrap_or("unknown"),
+                outcome.current.as_deref().unwrap_or("(none)")
+            );
+        }
         if outcome.exhausted {
+            let reset_hint = outcome
+                .earliest_reset_at
+                .map(|ts| format!("，earliest_reset_at={}", ts))
+                .unwrap_or_default();
+            eprintln!(
+                "[Proxy] client stream retry: Server 已无可用账号{}",
+                reset_hint
+            );
             return None;
         }
         let new_current = outcome.current?;
@@ -4379,7 +4439,9 @@ async fn handle_websocket(
                 }
             } else if is_auth_err {
                 // ───── 3) auth（401/403）→ 原地刷新当前账号 token，不切号 ─────
-                println!("[Proxy] WebSocket 握手 401/403，原地 silent_refresh 当前账号（不切号）...");
+                println!(
+                    "[Proxy] WebSocket 握手 401/403，原地 silent_refresh 当前账号（不切号）..."
+                );
                 match silent_refresh_current(&state).await {
                     SilentRefreshOutcome::Refreshed(new_tok) => {
                         let new_chatgpt = new_tok.starts_with("eyJ");
@@ -4401,8 +4463,17 @@ async fn handle_websocket(
                             }
                         }
                     }
+                    SilentRefreshOutcome::OtherError(e) => {
+                        eprintln!("[Proxy] WebSocket silent_refresh 失败: {}", e);
+                        // OtherError：不在 WS 路径切号（避免烧号），
+                        // 报错让 codex 自己重连；真要换号交给用户或 HTTP 路径决策
+                        return Ok(error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "WebSocket 认证失败（已尝试刷新当前账号，未切号）",
+                        ));
+                    }
                     _ => {
-                        // LoggedOut / NoRefreshToken / OtherError：不在 WS 路径切号（避免烧号），
+                        // LoggedOut / NoRefreshToken：不在 WS 路径切号（避免烧号），
                         // 报错让 codex 自己重连；真要换号交给用户或 HTTP 路径决策
                         return Ok(error_response(
                             StatusCode::BAD_GATEWAY,
@@ -4412,7 +4483,10 @@ async fn handle_websocket(
                 }
             } else {
                 // ───── 4) 纯网络层 / 502 / 504 / 未知 → 不切号，直接返回让 codex 重连 ─────
-                eprintln!("[Proxy] WebSocket 上游连接失败（网络层/非额度，不切号）: {}", e);
+                eprintln!(
+                    "[Proxy] WebSocket 上游连接失败（网络层/非额度，不切号）: {}",
+                    e
+                );
                 return Ok(error_response(
                     StatusCode::BAD_GATEWAY,
                     "WebSocket 上游连接失败",
@@ -4560,14 +4634,6 @@ const GLOBAL_CAPACITY_KEYWORDS: &[&str] = &[
     "model overloaded",
     "service unavailable",
 ];
-
-/// 任意限额/容量信号（任一类都算"上游不让发"）
-fn matches_any_limit_signal(lower: &str) -> bool {
-    PER_ACCOUNT_LIMIT_KEYWORDS
-        .iter()
-        .any(|kw| lower.contains(kw))
-        || GLOBAL_CAPACITY_KEYWORDS.iter().any(|kw| lower.contains(kw))
-}
 
 fn matches_global_capacity(lower: &str) -> bool {
     GLOBAL_CAPACITY_KEYWORDS.iter().any(|kw| lower.contains(kw))
@@ -4805,9 +4871,7 @@ async fn bridge_websockets<S1, S2>(
         while let Some(msg) = client_read.next().await {
             match msg {
                 Ok(msg) => {
-                    let cnt = c2u_count_b
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
+                    let cnt = c2u_count_b.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if cnt == 1 {
                         println!(
                             "[Proxy] WS bridge: 首帧 client→upstream ({})",
@@ -4875,9 +4939,7 @@ async fn bridge_websockets<S1, S2>(
         while let Some(msg) = upstream_read.next().await {
             match msg {
                 Ok(msg) => {
-                    let cnt = u2c_count_b
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
+                    let cnt = u2c_count_b.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if cnt == 1 {
                         println!(
                             "[Proxy] WS bridge: 首帧 upstream→client ({})",
@@ -5009,10 +5071,7 @@ async fn bridge_websockets<S1, S2>(
 
                     if msg.is_close() {
                         if let tungstenite::Message::Close(ref cf) = msg {
-                            println!(
-                                "[Proxy] WS bridge: upstream 发送 Close: {:?}",
-                                cf
-                            );
+                            println!("[Proxy] WS bridge: upstream 发送 Close: {:?}", cf);
                         }
                         let _ = client_write.send(msg).await;
                         break;
@@ -5038,9 +5097,9 @@ async fn bridge_websockets<S1, S2>(
         if !saw_completed && !has_function_call && frames >= 20 {
             // 即使 response_id 没抓到，也合成一条（用 generated id）—— 反正 codex 看的是
             // type=response.completed 就当一轮 done，不会拒绝
-            let rid = response_id
-                .clone()
-                .unwrap_or_else(|| format!("resp_synthetic_{}", chrono::Utc::now().timestamp_millis()));
+            let rid = response_id.clone().unwrap_or_else(|| {
+                format!("resp_synthetic_{}", chrono::Utc::now().timestamp_millis())
+            });
             let synthetic = serde_json::json!({
                 "type": "response.completed",
                 "response": {
@@ -5166,9 +5225,9 @@ fn normalize_chat_completions_error(
     let code = v
         .pointer("/error/code")
         .and_then(|v| {
-            v.as_str().map(String::from).or_else(|| {
-                v.as_i64().map(|n| n.to_string())
-            })
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
         })
         .unwrap_or_default();
     let hint = crate::provider_quirks::enhance_error_hint(provider, &msg);
@@ -5228,7 +5287,10 @@ fn normalize_chat_completions_error(
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
         let mut error_obj = original_obj.as_object().cloned().unwrap_or_default();
-        error_obj.insert("message".to_string(), serde_json::Value::String(with_hint(&original_msg)));
+        error_obj.insert(
+            "message".to_string(),
+            serde_json::Value::String(with_hint(&original_msg)),
+        );
         Some(serde_json::json!({"error": error_obj}))
     } else {
         None
@@ -5256,7 +5318,11 @@ fn normalize_chat_completions_error(
                 status.as_u16(),
                 new_status.as_u16(),
                 reason,
-                if hint.is_some() { ", with provider hint" } else { "" }
+                if hint.is_some() {
+                    ", with provider hint"
+                } else {
+                    ""
+                }
             );
             (new_status, Bytes::from(bytes))
         }
@@ -5304,8 +5370,15 @@ async fn handle_chat_completions_relay_websocket(
         )
         .await;
         println!("[Proxy] chat_completions Relay WS 适配器已连接");
-    { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
-        .and_then(|mut f| std::io::Write::write_all(&mut f, b"[ENTRY] WS adapter connected\n")); }
+        {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/codex-relay-debug.log")
+                .and_then(|mut f| {
+                    std::io::Write::write_all(&mut f, b"[ENTRY] WS adapter connected\n")
+                });
+        }
 
         loop {
             // 同时监听：client 下一个消息 / 切号或路由变更触发的 ws_disconnect
@@ -5319,7 +5392,9 @@ async fn handle_chat_completions_relay_websocket(
                     break;
                 }
             };
-            let Some(msg) = next_msg else { break; };
+            let Some(msg) = next_msg else {
+                break;
+            };
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
@@ -5339,7 +5414,10 @@ async fn handle_chat_completions_relay_websocket(
             println!("[Proxy] chat relay WS 收到 client msg: {}", kind);
             match msg {
                 tungstenite::Message::Text(text) => {
-                    println!("[Proxy] chat relay WS Text preview: {}", &text[..text.len().min(180)]);
+                    println!(
+                        "[Proxy] chat relay WS Text preview: {}",
+                        &text[..text.len().min(180)]
+                    );
                     if let Err(e) = handle_chat_relay_ws_text(
                         &state,
                         &relay,
@@ -5382,7 +5460,7 @@ async fn handle_chat_completions_relay_websocket(
 async fn handle_chat_relay_ws_text<S>(
     state: &Arc<ProxyState>,
     relay: &RelayRoute,
-    req_headers: &hyper::HeaderMap,
+    _req_headers: &hyper::HeaderMap,
     text: &str,
     client_ws: &mut tokio_tungstenite::WebSocketStream<S>,
 ) -> Result<(), String>
@@ -5428,7 +5506,10 @@ where
         crate::relay_translate::translate_request(&body_for_translate, &model)
             .map_err(|e| format!("translator 请求处理失败: {}", e))?;
 
-    eprintln!("[Proxy] chat relay WS 翻译后 body 前200字符: {}", String::from_utf8_lossy(&chat_body[..chat_body.len().min(200)]));
+    eprintln!(
+        "[Proxy] chat relay WS 翻译后 body 前200字符: {}",
+        String::from_utf8_lossy(&chat_body[..chat_body.len().min(200)])
+    );
 
     let base = relay
         .base_url
@@ -5461,15 +5542,30 @@ where
     );
     // DEBUG: dump request to log file
     {
-        let debug_line = format!("[WS] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
-            upstream_url, translator_state.model, chat_body.len(),
-            String::from_utf8_lossy(&chat_body).contains("webSearchEnabled"));
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+        let debug_line = format!(
+            "[WS] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
+            upstream_url,
+            translator_state.model,
+            chat_body.len(),
+            String::from_utf8_lossy(&chat_body).contains("webSearchEnabled")
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
             .and_then(|mut f| std::io::Write::write_all(&mut f, debug_line.as_bytes()));
         // Dump first 500 chars of body
         let preview = String::from_utf8_lossy(&chat_body[..chat_body.len().min(500)]);
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("  body_preview: {}\n\n", preview).as_bytes()));
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| {
+                std::io::Write::write_all(
+                    &mut f,
+                    format!("  body_preview: {}\n\n", preview).as_bytes(),
+                )
+            });
     }
     let upstream_resp = state
         .client
@@ -5524,9 +5620,10 @@ where
                             break;
                         }
                         crate::relay_translate::ChatSseEvent::Data(payload) => {
-                            for translated in
-                                crate::relay_translate::handle_chunk(&mut translator_state, &payload)
-                            {
+                            for translated in crate::relay_translate::handle_chunk(
+                                &mut translator_state,
+                                &payload,
+                            ) {
                                 send_sse_events_as_ws_json(client_ws, translated).await?;
                             }
                         }
@@ -5634,8 +5731,23 @@ async fn handle_chat_completions_relay(
     }
 
     // DEBUG: log HTTP relay entry
-    { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
-        .and_then(|mut f| std::io::Write::write_all(&mut f, format!("[HTTP-ENTRY] path={} body_len={}\n", path_and_query, body_bytes.len()).as_bytes())); }
+    {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| {
+                std::io::Write::write_all(
+                    &mut f,
+                    format!(
+                        "[HTTP-ENTRY] path={} body_len={}\n",
+                        path_and_query,
+                        body_bytes.len()
+                    )
+                    .as_bytes(),
+                )
+            });
+    }
     // 翻译请求体
     if body_bytes.is_empty() {
         eprintln!(
@@ -5659,7 +5771,11 @@ async fn handle_chat_completions_relay(
         Some("zstd") | Some("x-zstd") => match zstd::decode_all(body_bytes.as_ref()) {
             Ok(out) => Bytes::from(out),
             Err(e) => {
-                eprintln!("[Proxy] relay translate zstd 解压失败: {} body_len={}", e, body_bytes.len());
+                eprintln!(
+                    "[Proxy] relay translate zstd 解压失败: {} body_len={}",
+                    e,
+                    body_bytes.len()
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     &format!("translator: zstd decompress failed: {}", e),
@@ -5673,7 +5789,11 @@ async fn handle_chat_completions_relay(
             match decoder.read_to_end(&mut out) {
                 Ok(_) => Bytes::from(out),
                 Err(e) => {
-                    eprintln!("[Proxy] relay translate gzip 解压失败: {} body_len={}", e, body_bytes.len());
+                    eprintln!(
+                        "[Proxy] relay translate gzip 解压失败: {} body_len={}",
+                        e,
+                        body_bytes.len()
+                    );
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         &format!("translator: gzip decompress failed: {}", e),
@@ -5707,13 +5827,15 @@ async fn handle_chat_completions_relay(
         relay.model_fallback.as_deref(),
     );
     let model = extract_model_from_body(&body_for_translate);
-    let (mut chat_body, mut translator_state) =
-        match crate::relay_translate::translate_request(&body_for_translate, &model) {
-            Ok(x) => x,
-            Err(e) => {
-                let head_len = body_for_translate.len().min(160);
-                let head_str = String::from_utf8_lossy(&body_for_translate[..head_len]);
-                eprintln!(
+    let (mut chat_body, mut translator_state) = match crate::relay_translate::translate_request(
+        &body_for_translate,
+        &model,
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            let head_len = body_for_translate.len().min(160);
+            let head_str = String::from_utf8_lossy(&body_for_translate[..head_len]);
+            eprintln!(
                     "[Proxy] relay translate 请求失败: {} | method={} path={} encoding={:?} body_len={} body_head={:?}",
                     e,
                     method,
@@ -5722,12 +5844,12 @@ async fn handle_chat_completions_relay(
                     body_for_translate.len(),
                     head_str,
                 );
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("translator 请求处理失败: {}", e),
-                );
-            }
-        };
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("translator 请求处理失败: {}", e),
+            );
+        }
+    };
 
     let (upstream_url, upstream_host) = match build_chat_completions_url(base) {
         Some(x) => x,
@@ -5763,14 +5885,29 @@ async fn handle_chat_completions_relay(
     );
     // DEBUG: dump HTTP request to log file
     {
-        let debug_line = format!("[HTTP] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
-            upstream_url, translator_state.model, body_bytes_chat.len(),
-            String::from_utf8_lossy(&body_bytes_chat).contains("webSearchEnabled"));
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+        let debug_line = format!(
+            "[HTTP] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
+            upstream_url,
+            translator_state.model,
+            body_bytes_chat.len(),
+            String::from_utf8_lossy(&body_bytes_chat).contains("webSearchEnabled")
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
             .and_then(|mut f| std::io::Write::write_all(&mut f, debug_line.as_bytes()));
         let preview = String::from_utf8_lossy(&body_bytes_chat[..body_bytes_chat.len().min(500)]);
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("  body_preview: {}\n\n", preview).as_bytes()));
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| {
+                std::io::Write::write_all(
+                    &mut f,
+                    format!("  body_preview: {}\n\n", preview).as_bytes(),
+                )
+            });
     }
 
     let upstream_resp = match state

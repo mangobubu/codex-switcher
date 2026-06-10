@@ -100,9 +100,9 @@ impl UsageFetcher {
             if let Some(ref rt) = refresh_token {
                 // 锁 key 优先 account_id（最稳定 = OpenAI workspace id），缺时退到 rt
                 // 前缀（rt 跟 OpenAI account 1:1 绑定，唯一性够用，只是切号轮换后失效）
-                let lock_key = account_id.clone().unwrap_or_else(|| {
-                    format!("rt:{}", &rt[..rt.len().min(16)])
-                });
+                let lock_key = account_id
+                    .clone()
+                    .unwrap_or_else(|| format!("rt:{}", &rt[..rt.len().min(16)]));
                 match crate::oauth::refresh_access_token_locked(&lock_key, rt).await {
                     Ok(token_res) => {
                         current_token = token_res.access_token.clone();
@@ -314,15 +314,6 @@ impl UsageFetcher {
         }
     }
 
-    /// 解析整数（支持字符串和数字）
-    fn parse_int(v: &Value) -> Option<i32> {
-        match v {
-            Value::Number(n) => n.as_i64().map(|i| i as i32),
-            Value::String(s) => s.parse().ok(),
-            _ => None,
-        }
-    }
-
     /// 格式化重置时间（时间戳）
     fn format_reset(reset_at: i64) -> String {
         use chrono::{TimeZone, Utc};
@@ -482,7 +473,10 @@ impl UsageFetcher {
                 .await
                 .map(|s| s.chars().take(200).collect::<String>())
                 .unwrap_or_default();
-            return Err(format!("HTTP {} @ {} → {}", "subscription", sub_url, body_preview));
+            return Err(format!(
+                "HTTP {} @ {} → {}",
+                "subscription", sub_url, body_preview
+            ));
         }
         let sub_body: Value = sub_resp
             .json()
@@ -507,7 +501,9 @@ impl UsageFetcher {
                 .json()
                 .await
                 .map_err(|e| format!("usage JSON 解析失败: {}", e))?;
-            body.get("total_usage").and_then(|v| v.as_f64()).unwrap_or(0.0)
+            body.get("total_usage")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
         } else {
             0.0
         };

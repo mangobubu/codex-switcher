@@ -337,9 +337,7 @@ pub fn start_anchor_refresh(
                     };
 
                     // 3b) 写盘（extended_expiry 防 Codex.app 自刷）
-                    if let Err(e) =
-                        AccountStore::write_codex_auth_extended_expiry(&auth_value)
-                    {
+                    if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&auth_value) {
                         eprintln!("[AnchorRefresh] 写 ~/.codex/auth.json 失败: {}", e);
                     } else {
                         println!(
@@ -356,8 +354,7 @@ pub fn start_anchor_refresh(
                     );
                     // rt 失效是致命情况：手机 bridge 会跟着断。标记账号 token_invalid，
                     // 让 UI 弹出"重新登录 anchor"提示
-                    if is_reused_or_revoked_error(&reason) || is_logged_out_error(&reason)
-                    {
+                    if is_reused_or_revoked_error(&reason) || is_logged_out_error(&reason) {
                         if let Ok(mut store) = store.lock() {
                             if let Some(account) = store.accounts.get_mut(&anchor_id) {
                                 if is_logged_out_error(&reason) {

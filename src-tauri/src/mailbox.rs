@@ -442,7 +442,7 @@ impl NissanSerena {
             .await;
 
         // baseline: 第一次拉到的 code，等到看见不同的 6 位（且时间 >= since 的话也合规）才返回
-        let (mut baseline_code, mut baseline_time) = match self.fetch_top(email).await {
+        let (mut baseline_code, baseline_time) = match self.fetch_top(email).await {
             Ok(Some((c, t))) => (Some(c), Some(t)),
             _ => (None, None),
         };
@@ -482,7 +482,6 @@ impl NissanSerena {
                     // 同 code 继续等
                     if baseline_code.is_none() {
                         baseline_code = Some(code);
-                        baseline_time = Some(time);
                     }
                 }
                 Ok(None) => {

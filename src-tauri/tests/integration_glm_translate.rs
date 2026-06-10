@@ -10,7 +10,7 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::time::Duration;
 
-use codex_switcher_lib::relay_translate::{self, ChatSseBuffer, ChatSseEvent, TranslateError};
+use codex_switcher_lib::relay_translate::{self, ChatSseBuffer, ChatSseEvent};
 
 fn spawn_mock_chat_completions_server(sse_body: &'static str) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -120,15 +120,19 @@ data: [DONE]\n\n";
 }
 
 #[test]
-fn translator_rejects_chained_request() {
+fn translator_tolerates_previous_response_id() {
     let codex_body = serde_json::json!({
         "model": "gpt-5",
         "input": "hi",
         "previous_response_id": "resp_old",
     });
     let bytes = serde_json::to_vec(&codex_body).unwrap();
-    let err = relay_translate::translate_request(&bytes, "glm-5.1").unwrap_err();
-    assert!(matches!(err, TranslateError::ChainingUnsupported));
+    let (chat_body, _state) = relay_translate::translate_request(&bytes, "glm-5.1").unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&chat_body).unwrap();
+    assert!(
+        v.get("previous_response_id").map_or(true, |p| p.is_null()),
+        "previous_response_id must not be forwarded to chat/completions"
+    );
 }
 
 #[test]

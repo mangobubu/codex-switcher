@@ -6,7 +6,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ────────────────────────────────────────────────────────────────
@@ -347,8 +346,6 @@ impl SkillStore {
     /// 新架构：整个目录是 symlink，不需要 per-skill 同步
     pub fn toggle_app_link(app: &str, enabled: bool) -> Result<(), String> {
         let target = app_skills_dir(app).ok_or_else(|| format!("未知 app: {}", app))?;
-        let ssot = ssot_dir();
-
         if enabled {
             link_app_to_ssot(app)?;
         } else {
@@ -802,15 +799,14 @@ pub fn zip_skill_dir(name: &str) -> Result<Vec<u8>, String> {
                 }
                 let rel = path.strip_prefix(prefix).unwrap_or(&path);
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                let mut file_opts = *opts;
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        file_opts = file_opts.unix_permissions(meta.permissions().mode() & 0o777);
-                    }
-                    let _ = meta;
-                }
+                let file_opts = *opts;
+                #[cfg(unix)]
+                let file_opts = if let Ok(meta) = std::fs::metadata(&path) {
+                    use std::os::unix::fs::PermissionsExt;
+                    file_opts.unix_permissions(meta.permissions().mode() & 0o777)
+                } else {
+                    file_opts
+                };
                 zip.start_file(rel_str, file_opts)
                     .map_err(|e| format!("开始文件失败: {}", e))?;
                 let mut f = std::fs::File::open(&path)

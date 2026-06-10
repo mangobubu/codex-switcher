@@ -683,25 +683,105 @@ impl AccountStore {
         // 跟 src/data/relay_presets.ts 对齐，覆盖 0.5.30 之前可能没被标 Relay 的 preset。
         // 这里只填路由必要字段；详细的 model_map 留给运行时（UI 修过的也尊重）。
         const KNOWN_RELAY_PRESETS: &[(&str, &str, &str, &str)] = &[
-            ("deepseek_api", "https://api.deepseek.com/v1", "chat_completions", "deepseek-v4-pro"),
-            ("moonshot_kimi", "https://api.moonshot.cn/v1", "chat_completions", "kimi-k2-turbo-preview"),
-            ("minimax_api", "https://api.minimaxi.com/v1", "chat_completions", "MiniMax-M2"),
-            ("alibaba_dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1", "chat_completions", "qwen-max"),
-            ("tencent_hunyuan", "https://api.hunyuan.cloud.tencent.com/v1", "chat_completions", "hunyuan-large"),
-            ("baidu_qianfan", "https://qianfan.baidubce.com/v2", "chat_completions", "ernie-4.5-turbo-128k"),
-            ("fireworks_ai", "https://api.fireworks.ai/inference/v1", "chat_completions", "accounts/fireworks/models/kimi-k2-instruct"),
-            ("stepfun_step", "https://api.stepfun.com/v1", "chat_completions", "step-2-16k"),
-            ("openrouter", "https://openrouter.ai/api/v1", "chat_completions", "anthropic/claude-3.5-sonnet"),
-            ("volcengine_ark", "https://ark.cn-beijing.volces.com/api/v3", "chat_completions", "doubao-pro-32k"),
-            ("ucloud_modelverse", "https://api.modelverse.cn/v1", "chat_completions", "deepseek-v3.1"),
-            ("glm", "https://open.bigmodel.cn/api/paas/v4", "chat_completions", "glm-5.1"),
-            ("glm_coding", "https://open.bigmodel.cn/api/coding/paas/v4", "chat_completions", "glm-5.1"),
-            ("mimo_token_plan_sgp", "https://token-plan-sgp.xiaomimimo.com/v1", "chat_completions", "mimo-v2.5-pro"),
-            ("mimo_api_pay", "https://api.xiaomimimo.com/v1", "chat_completions", "mimo-v2.5-pro"),
+            (
+                "deepseek_api",
+                "https://api.deepseek.com/v1",
+                "chat_completions",
+                "deepseek-v4-pro",
+            ),
+            (
+                "moonshot_kimi",
+                "https://api.moonshot.cn/v1",
+                "chat_completions",
+                "kimi-k2-turbo-preview",
+            ),
+            (
+                "minimax_api",
+                "https://api.minimaxi.com/v1",
+                "chat_completions",
+                "MiniMax-M2",
+            ),
+            (
+                "alibaba_dashscope",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "chat_completions",
+                "qwen-max",
+            ),
+            (
+                "tencent_hunyuan",
+                "https://api.hunyuan.cloud.tencent.com/v1",
+                "chat_completions",
+                "hunyuan-large",
+            ),
+            (
+                "baidu_qianfan",
+                "https://qianfan.baidubce.com/v2",
+                "chat_completions",
+                "ernie-4.5-turbo-128k",
+            ),
+            (
+                "fireworks_ai",
+                "https://api.fireworks.ai/inference/v1",
+                "chat_completions",
+                "accounts/fireworks/models/kimi-k2-instruct",
+            ),
+            (
+                "stepfun_step",
+                "https://api.stepfun.com/v1",
+                "chat_completions",
+                "step-2-16k",
+            ),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "chat_completions",
+                "anthropic/claude-3.5-sonnet",
+            ),
+            (
+                "volcengine_ark",
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "chat_completions",
+                "doubao-pro-32k",
+            ),
+            (
+                "ucloud_modelverse",
+                "https://api.modelverse.cn/v1",
+                "chat_completions",
+                "deepseek-v3.1",
+            ),
+            (
+                "glm",
+                "https://open.bigmodel.cn/api/paas/v4",
+                "chat_completions",
+                "glm-5.1",
+            ),
+            (
+                "glm_coding",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "chat_completions",
+                "glm-5.1",
+            ),
+            (
+                "mimo_token_plan_sgp",
+                "https://token-plan-sgp.xiaomimimo.com/v1",
+                "chat_completions",
+                "mimo-v2.5-pro",
+            ),
+            (
+                "mimo_api_pay",
+                "https://api.xiaomimimo.com/v1",
+                "chat_completions",
+                "mimo-v2.5-pro",
+            ),
             ("generic_responses_relay", "", "responses", ""),
             ("aiberm", "", "responses", ""),
             ("whatai", "", "responses", ""),
-            ("modelscope", "https://api-inference.modelscope.cn/v1", "chat_completions", "Qwen/Qwen2.5-72B-Instruct"),
+            (
+                "modelscope",
+                "https://api-inference.modelscope.cn/v1",
+                "chat_completions",
+                "Qwen/Qwen2.5-72B-Instruct",
+            ),
             ("freemodel", "https://api.freemodel.dev", "responses", ""),
         ];
         let mut changed = false;
@@ -717,9 +797,8 @@ impl AccountStore {
                 .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
                 .filter(|s| !s.is_empty());
             let Some(pid) = preset_id else { continue };
-            let Some((_, base, protocol, fallback)) = KNOWN_RELAY_PRESETS
-                .iter()
-                .find(|(id, _, _, _)| *id == pid)
+            let Some((_, base, protocol, fallback)) =
+                KNOWN_RELAY_PRESETS.iter().find(|(id, _, _, _)| *id == pid)
             else {
                 continue;
             };
@@ -795,7 +874,9 @@ impl AccountStore {
                 "coding_plan"
             } else {
                 match preset_id.as_deref() {
-                    Some("glm_coding") | Some("mimo_token_plan_sgp") | Some("volcengine_ark")
+                    Some("glm_coding")
+                    | Some("mimo_token_plan_sgp")
+                    | Some("volcengine_ark")
                     | Some("ucloud_modelverse") => "coding_plan",
                     Some("generic_responses_relay") | Some("freemodel") | Some("custom") => {
                         "aggregator"
@@ -1867,9 +1948,14 @@ mod tests {
     #[test]
     fn anchor_can_be_set_on_oauth_account() {
         let (mut store, pro_id, _free_id) = make_oauth_store();
-        assert!(store.session_anchor_id().is_none(), "新 store 默认无 anchor");
+        assert!(
+            store.session_anchor_id().is_none(),
+            "新 store 默认无 anchor"
+        );
 
-        store.set_session_anchor(&pro_id, true).expect("OAuth 号可以当 anchor");
+        store
+            .set_session_anchor(&pro_id, true)
+            .expect("OAuth 号可以当 anchor");
 
         assert_eq!(store.session_anchor_id().as_deref(), Some(pro_id.as_str()));
         assert!(store.accounts.get(&pro_id).unwrap().is_session_anchor);

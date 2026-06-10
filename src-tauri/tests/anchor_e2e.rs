@@ -68,7 +68,8 @@ fn jwt_with_exp(exp_secs_from_now: i64) -> String {
 }
 
 fn make_oauth_auth(email: &str, account_id: &str, refresh_token: &str, at_exp_secs: i64) -> Value {
-    let id_token_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+    let id_token_header =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
     let id_token_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
         r#"{{"email":"{}","https://api.openai.com/auth":{{"chatgpt_account_id":"{}"}}}}"#,
         email, account_id
@@ -140,14 +141,8 @@ fn anchor_e2e_disk_routing() {
         .set_session_anchor(&pro_id, true)
         .expect("set anchor ok");
     // 先把 disk 强制写成 pro 的（模拟"设 anchor 时立刻落盘"那一步）
-    AccountStore::write_codex_auth(
-        &store
-            .accounts
-            .get(&pro_id)
-            .unwrap()
-            .to_codex_auth_value(),
-    )
-    .expect("seed disk with anchor");
+    AccountStore::write_codex_auth(&store.accounts.get(&pro_id).unwrap().to_codex_auth_value())
+        .expect("seed disk with anchor");
     let disk_before = read_disk_auth(&tmp).expect("disk has anchor seed");
     assert_eq!(account_id_of(&disk_before), Some("acct-pro"));
 
@@ -167,10 +162,7 @@ fn anchor_e2e_disk_routing() {
         !store.should_write_disk_for(&other_id),
         "non-anchor target 不允许写盘"
     );
-    assert!(
-        store.should_write_disk_for(&pro_id),
-        "anchor 自己仍可写盘"
-    );
+    assert!(store.should_write_disk_for(&pro_id), "anchor 自己仍可写盘");
 
     // ---- 场景 3: 切回 anchor → disk 应被更新（即便内容跟 disk 已有的一样） ----
     let before_mtime = fs::metadata(tmp.join(".codex/auth.json"))
