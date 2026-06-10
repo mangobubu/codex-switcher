@@ -140,13 +140,40 @@
     font-weight: 500;
 }
 
-.quota-badge {
+.quota-tags {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.quota-tag {
     padding: 4px 10px;
     font-size: 12px;
     font-weight: 700;
     border-radius: 6px;
+    white-space: nowrap;
+}
+
+.quota-tag.good {
     background: rgba(63, 185, 80, 0.2);
     color: var(--success-color);
+}
+
+.quota-tag.warning {
+    background: rgba(245, 158, 11, 0.18);
+    color: #d97706;
+}
+
+.quota-tag.danger {
+    background: rgba(239, 68, 68, 0.18);
+    color: #dc2626;
+}
+
+.quota-tag.neutral {
+    background: rgba(148, 163, 184, 0.18);
+    color: var(--text-muted);
 }
 
 .no-recommendation {

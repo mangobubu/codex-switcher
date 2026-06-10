@@ -58,14 +58,45 @@ export function Dashboard({
         isMismatched &&
         syncStatus?.matching_id === anchorAccount.id
     );
-    // 获取最佳账号推荐（配额最高的账号）
+    const quotaValue = (value: number | undefined) => (
+        typeof value === 'number' && Number.isFinite(value) ? value : -1
+    );
+
+    const formatQuotaPercent = (value: number | undefined) => (
+        typeof value === 'number' && Number.isFinite(value) ? `${Math.round(value)}%` : '-'
+    );
+
+    const quotaTagClass = (value: number | undefined) => {
+        if (typeof value !== 'number' || !Number.isFinite(value)) return 'neutral';
+        if (value <= 0) return 'danger';
+        if (value < 10) return 'warning';
+        return 'good';
+    };
+
+    const quotaScore = (account: Account) => {
+        const quota = account.cached_quota;
+        if (!quota) return -1;
+        return quotaValue(quota.weekly_left) * 0.65 + quotaValue(quota.five_hour_left) * 0.35;
+    };
+
+    // 获取最佳账号推荐：周配额和 5h 配额综合评分，周配额权重更高。
     const getBestAccount = () => {
-        if (accounts.length === 0) return null;
-        // 简单返回第一个非当前账号
-        return accounts.find(a => a.id !== currentAccount?.id) || null;
+        const candidates = [...accounts];
+        if (candidates.length === 0) return null;
+
+        return candidates.sort((a, b) => {
+            const scoreDiff = quotaScore(b) - quotaScore(a);
+            if (scoreDiff !== 0) return scoreDiff;
+
+            const weeklyDiff = quotaValue(b.cached_quota?.weekly_left) - quotaValue(a.cached_quota?.weekly_left);
+            if (weeklyDiff !== 0) return weeklyDiff;
+
+            return quotaValue(b.cached_quota?.five_hour_left) - quotaValue(a.cached_quota?.five_hour_left);
+        })[0] || null;
     };
 
     const bestAccount = getBestAccount();
+    const isBestCurrent = !!(bestAccount && currentAccount && bestAccount.id === currentAccount.id);
 
     return (
         <div className="dashboard">
@@ -212,18 +243,26 @@ export function Dashboard({
                                     <span className="label-text">推荐账号</span>
                                     <span className="account-email">{bestAccount.name}</span>
                                 </div>
-                                <span className="quota-badge">100%</span>
+                                <div className="quota-tags">
+                                    <span className={`quota-tag ${quotaTagClass(bestAccount.cached_quota?.five_hour_left)}`}>
+                                        5h {formatQuotaPercent(bestAccount.cached_quota?.five_hour_left)}
+                                    </span>
+                                    <span className={`quota-tag ${quotaTagClass(bestAccount.cached_quota?.weekly_left)}`}>
+                                        周 {formatQuotaPercent(bestAccount.cached_quota?.weekly_left)}
+                                    </span>
+                                </div>
                             </div>
                         ) : (
                             <p className="no-recommendation">暂无推荐</p>
                         )}
                     </div>
-                    {accounts.length > 1 && (
+                    {bestAccount && (
                         <button
                             className="btn btn-accent btn-full"
-                            onClick={() => bestAccount && onSwitch(bestAccount.id)}
+                            disabled={isBestCurrent}
+                            onClick={() => !isBestCurrent && onSwitch(bestAccount.id)}
                         >
-                            一键切换最佳
+                            {isBestCurrent ? '当前已是最佳' : '一键切换最佳'}
                         </button>
                     )}
                 </div>
