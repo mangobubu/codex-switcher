@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge, Eraser } from 'lucide-react';
 import { Account, AppSettings, RelayUsageCache, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
 const KIND_BADGE: Record<ReturnType<typeof effectiveKind>, { label: string; className: string }> = {
@@ -38,6 +39,14 @@ interface UsageData {
     weekly_label: string;
     plan_type: string;
     is_valid_for_cli: boolean;
+    updated_at?: string;
+}
+
+interface CodexQuotaUpdate {
+    account_id: string;
+    account_name: string;
+    usage: UsageData;
+    observed_at: string;
 }
 
 type FilterType = 'all' | 'sub' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
@@ -203,6 +212,7 @@ export function AccountList({
                     weekly_label: acc.cached_quota.weekly_label || '周限额',
                     plan_type: acc.cached_quota.plan_type,
                     is_valid_for_cli: isValid,
+                    updated_at: acc.cached_quota.updated_at,
                 };
                 if (!isValid) initialInvalids.add(acc.id);
             }
@@ -225,6 +235,38 @@ export function AccountList({
             return changed ? next : prev;
         });
     }, [accounts]);
+
+    useEffect(() => {
+        const unlisten = listen<CodexQuotaUpdate>('codex-quota-updated', (event) => {
+            const { account_id, usage, observed_at } = event.payload;
+            setUsageMap(prev => ({
+                ...prev,
+                [account_id]: {
+                    ...usage,
+                    five_hour_label: usage.five_hour_label || '5H 限额',
+                    weekly_label: usage.weekly_label || '周限额',
+                    is_valid_for_cli: usage.is_valid_for_cli !== false,
+                    updated_at: observed_at,
+                },
+            }));
+            setInvalidIds(prev => {
+                const next = new Set(prev);
+                if (usage.is_valid_for_cli === false) next.add(account_id);
+                else next.delete(account_id);
+                return next;
+            });
+            setBannedIds(prev => {
+                if (!prev.has(account_id)) return prev;
+                const next = new Set(prev);
+                next.delete(account_id);
+                return next;
+            });
+        });
+
+        return () => {
+            unlisten.then(fn => fn());
+        };
+    }, []);
 
     // 自动 reset 后重拉：cached 数据老于 reset_at 时窗口已经重置但缓存还是旧的 0%，
     // 触发一次 refresh。
@@ -410,7 +452,7 @@ export function AccountList({
                 ? 'remote_refresh_account_quota'
                 : 'get_quota_by_id';
             const usage = await invoke<UsageData>(cmd, { id });
-            setUsageMap(prev => ({ ...prev, [id]: usage }));
+            setUsageMap(prev => ({ ...prev, [id]: { ...usage, updated_at: new Date().toISOString() } }));
             setInvalidIds(prev => {
                 const next = new Set(prev);
                 usage.is_valid_for_cli ? next.delete(id) : next.add(id);
@@ -800,7 +842,7 @@ export function AccountList({
                                     </div>
                                     <div className="time-item refresh">
                                         <span className="time-label">刷新:</span>
-                                        <span className="time-val">{formatDate(acc.cached_quota?.updated_at)}</span>
+                                        <span className="time-val">{formatDate(usage?.updated_at || acc.cached_quota?.updated_at)}</span>
                                     </div>
                                 </div>
                                 <div className="col-actions">

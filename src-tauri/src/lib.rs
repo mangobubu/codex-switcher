@@ -4,6 +4,7 @@
 
 pub mod account;
 mod bulk_import;
+mod codex_quota;
 mod codex_sessions;
 mod codex_ua;
 mod deep_link;
@@ -4051,6 +4052,25 @@ fn show_main_window_cmd(app: tauri::AppHandle) {
     crate::tray::show_main_window_from_cmd(&app);
 }
 
+/// 设置托盘弹窗是否常驻。常驻时失焦不隐藏，并允许用户拖动边缘缩放。
+#[tauri::command]
+fn set_tray_popup_pinned_cmd(app: tauri::AppHandle, pinned: bool) -> Result<(), String> {
+    crate::tray::set_popup_pinned(pinned);
+    if let Some(win) = app.get_webview_window("tray-popup") {
+        win.set_resizable(pinned).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 从 Rust 端启动托盘弹窗拖动，绕过前端 Webview API 在部分平台失效的问题。
+#[tauri::command]
+fn start_tray_popup_drag_cmd(app: tauri::AppHandle) -> Result<(), String> {
+    let Some(win) = app.get_webview_window("tray-popup") else {
+        return Err("托盘弹窗不存在".to_string());
+    };
+    win.start_dragging().map_err(|e| e.to_string())
+}
+
 /// 杀死所有 codex 相关进程（排除 Codex Switcher 自身）
 #[tauri::command]
 fn kill_codex_processes() -> Result<String, String> {
@@ -5141,6 +5161,11 @@ pub fn run() {
                 println!("[QuotaRefresh] 启动中（setup 阶段）");
             }
 
+            // Codex Desktop 本地 rollout 配额监听：不打网络，只增量读
+            // ~/.codex/sessions/**/rollout-*.jsonl 里的 rate_limits。
+            let _codex_quota_handle =
+                codex_quota::start(state.store.clone(), app.handle().clone());
+
             // 启动时立刻跑一次同步，把 store/disk 不一致 + 落后的 RT 立即对齐
             let store_for_init = state.store.clone();
             tauri::async_runtime::spawn(async move {
@@ -5302,6 +5327,8 @@ pub fn run() {
             get_token_stats,
             reset_token_stats,
             show_main_window_cmd,
+            set_tray_popup_pinned_cmd,
+            start_tray_popup_drag_cmd,
             set_codex_fast_mode,
             get_codex_fast_mode,
             set_codex_features_goals,

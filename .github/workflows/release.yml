@@ -2,7 +2,7 @@ name: Release
 on:
   push:
     tags:
-      - "v0.7.4"
+      - "v*"
   workflow_dispatch:
 
 jobs:
@@ -96,6 +96,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -104,6 +106,46 @@ jobs:
           pattern: "release-assets-*"
           merge-multiple: true
 
+      - name: Generate changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+          git fetch --force --tags
+          PREVIOUS_TAG="$(git tag --list "v*" --sort=-v:refname | grep -v "^${TAG}$" | head -n 1 || true)"
+
+          {
+            echo "# 更新日志 - ${TAG}"
+            echo
+
+            if [ -n "${PREVIOUS_TAG}" ]; then
+              echo "比较范围：\`${PREVIOUS_TAG}...${TAG}\`"
+              echo
+              echo "## 变更记录"
+              COMMITS="$(git log "${PREVIOUS_TAG}..${TAG}" --pretty=format:"- %s (%h)" --no-merges || true)"
+              if [ -n "${COMMITS}" ]; then
+                echo "${COMMITS}"
+              else
+                echo "- 本次版本没有检测到普通提交。"
+              fi
+              echo
+              echo
+              echo "## 合并记录"
+              MERGES="$(git log "${PREVIOUS_TAG}..${TAG}" --pretty=format:"- %s (%h)" --merges || true)"
+              if [ -n "${MERGES}" ]; then
+                echo "${MERGES}"
+              else
+                echo "- 本次版本没有检测到合并提交。"
+              fi
+            else
+              echo "未找到上一个 tag，以下为当前版本提交："
+              echo
+              git log -1 --pretty=format:"- %s (%h)"
+              echo
+            fi
+          } > CHANGELOG.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -111,8 +153,7 @@ jobs:
             all-artifacts/**/*
           tag_name: ${{ github.ref_name }}
           name: "Release ${{ github.ref_name }}"
-          # 自动从 commits / merged PRs 生成 release notes，比手写 "New release for tag" 信息量大很多
-          generate_release_notes: true
+          body_path: CHANGELOG.md
           draft: false
           prerelease: false
         env:

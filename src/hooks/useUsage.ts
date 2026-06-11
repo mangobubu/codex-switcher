@@ -7,14 +7,25 @@ export interface UsageDisplay {
     plan_type: string;
     five_hour_used: number;
     five_hour_left: number;
+    five_hour_label?: string;
     five_hour_reset: string;
     five_hour_reset_at?: number;
     weekly_used: number;
     weekly_left: number;
+    weekly_label?: string;
     weekly_reset: string;
     weekly_reset_at?: number;
     credits_balance: number | null;
     has_credits: boolean;
+    is_valid_for_cli?: boolean;
+    updated_at?: string;
+}
+
+interface CodexQuotaUpdate {
+    account_id: string;
+    account_name: string;
+    usage: UsageDisplay;
+    observed_at: string;
 }
 
 /// Relay (中转账号) 没有 OpenAI 5h+周窗口模型，把 GLM 这类返回的百分比剩余值
@@ -46,14 +57,18 @@ function cachedQuotaToUsage(account: Account): UsageDisplay | null {
         plan_type: quota.plan_type,
         five_hour_used: Math.max(0, 100 - quota.five_hour_left),
         five_hour_left: quota.five_hour_left,
+        five_hour_label: quota.five_hour_label,
         five_hour_reset: quota.five_hour_reset,
         five_hour_reset_at: quota.five_hour_reset_at,
         weekly_used: Math.max(0, 100 - quota.weekly_left),
         weekly_left: quota.weekly_left,
+        weekly_label: quota.weekly_label,
         weekly_reset: quota.weekly_reset,
         weekly_reset_at: quota.weekly_reset_at,
         credits_balance: null,
         has_credits: false,
+        is_valid_for_cli: quota.is_valid_for_cli,
+        updated_at: quota.updated_at,
     };
 }
 
@@ -136,6 +151,25 @@ export function useUsage() {
             unlisten.then(fn => fn());
         };
     }, [syncUsageFromCache]);
+
+    useEffect(() => {
+        const unlisten = listen<CodexQuotaUpdate>('codex-quota-updated', async (event) => {
+            try {
+                const currentId = await invoke<string | null>('get_current_account_id');
+                if (currentId && event.payload.account_id === currentId) {
+                    setUsage({ ...event.payload.usage, updated_at: event.payload.observed_at });
+                    setError(null);
+                    setLoading(false);
+                }
+            } catch (err) {
+                setError(String(err));
+            }
+        });
+
+        return () => {
+            unlisten.then(fn => fn());
+        };
+    }, []);
 
     return {
         usage,

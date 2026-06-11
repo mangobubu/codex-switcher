@@ -73,8 +73,18 @@ export function Dashboard({
         return 'good';
     };
 
+    const realtimeQuotaFor = (account: Account) => {
+        if (currentAccount && usage && account.id === currentAccount.id) {
+            return {
+                five_hour_left: usage.five_hour_left,
+                weekly_left: usage.weekly_left,
+            };
+        }
+        return account.cached_quota;
+    };
+
     const quotaScore = (account: Account) => {
-        const quota = account.cached_quota;
+        const quota = realtimeQuotaFor(account);
         if (!quota) return -1;
         return quotaValue(quota.weekly_left) * 0.65 + quotaValue(quota.five_hour_left) * 0.35;
     };
@@ -97,6 +107,7 @@ export function Dashboard({
 
     const bestAccount = getBestAccount();
     const isBestCurrent = !!(bestAccount && currentAccount && bestAccount.id === currentAccount.id);
+    const bestQuota = bestAccount ? realtimeQuotaFor(bestAccount) : null;
 
     return (
         <div className="dashboard">
@@ -244,11 +255,11 @@ export function Dashboard({
                                     <span className="account-email">{bestAccount.name}</span>
                                 </div>
                                 <div className="quota-tags">
-                                    <span className={`quota-tag ${quotaTagClass(bestAccount.cached_quota?.five_hour_left)}`}>
-                                        5h {formatQuotaPercent(bestAccount.cached_quota?.five_hour_left)}
+                                    <span className={`quota-tag ${quotaTagClass(bestQuota?.five_hour_left)}`}>
+                                        5h {formatQuotaPercent(bestQuota?.five_hour_left)}
                                     </span>
-                                    <span className={`quota-tag ${quotaTagClass(bestAccount.cached_quota?.weekly_left)}`}>
-                                        周 {formatQuotaPercent(bestAccount.cached_quota?.weekly_left)}
+                                    <span className={`quota-tag ${quotaTagClass(bestQuota?.weekly_left)}`}>
+                                        周 {formatQuotaPercent(bestQuota?.weekly_left)}
                                     </span>
                                 </div>
                             </div>

@@ -26,17 +26,41 @@ body.is-tray-popup,
     gap: 12px;
 }
 
+.tray-popup.pinned {
+    overflow: auto;
+    min-width: 320px;
+    min-height: 360px;
+}
+
 /* ===== Header ===== */
 .tp-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 10px;
+}
+
+.tray-popup.pinned .tp-header {
+    cursor: move;
+    -webkit-app-region: drag;
+    app-region: drag;
+}
+
+.tray-popup.pinned .tp-pin-control,
+.tray-popup.pinned .tp-pin-control *,
+.tray-popup.pinned .tp-badge,
+.tray-popup.pinned button,
+.tray-popup.pinned input,
+.tray-popup.pinned label {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
 }
 
 .tp-title {
     display: flex;
     align-items: center;
     gap: 10px;
+    min-width: 0;
 }
 
 .tp-logo {
@@ -47,7 +71,8 @@ body.is-tray-popup,
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 17px;
+    font-size: 12px;
+    font-weight: 800;
     box-shadow: 0 2px 8px rgba(124, 92, 224, 0.4);
 }
 
@@ -61,6 +86,24 @@ body.is-tray-popup,
     font-size: 10px;
     color: rgba(255, 255, 255, 0.4);
     letter-spacing: 0.3px;
+}
+
+.tp-pin-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: auto;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.62);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.tp-pin-control input {
+    width: 13px;
+    height: 13px;
+    accent-color: #8b5cf6;
+    cursor: pointer;
 }
 
 .tp-badge {

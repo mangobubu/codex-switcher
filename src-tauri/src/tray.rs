@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -11,6 +12,7 @@ const POPUP_HEIGHT: f64 = 410.0;
 const POPUP_MARGIN: f64 = 8.0;
 const TRAY_MENU_SHOW: &str = "show_main_window";
 const TRAY_MENU_QUIT: &str = "quit_app";
+static POPUP_PINNED: AtomicBool = AtomicBool::new(false);
 
 /// 初始化系统托盘
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -109,6 +111,9 @@ fn toggle_popup(app: &AppHandle, position: tauri::PhysicalPosition<f64>) {
             let win_clone = win.clone();
             win.on_window_event(move |event| {
                 if let tauri::WindowEvent::Focused(false) = event {
+                    if is_popup_pinned() {
+                        return;
+                    }
                     let _ = win_clone.hide();
                 }
             });
@@ -193,6 +198,14 @@ fn position_popup(
     )))
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn set_popup_pinned(pinned: bool) {
+    POPUP_PINNED.store(pinned, Ordering::Relaxed);
+}
+
+pub fn is_popup_pinned() -> bool {
+    POPUP_PINNED.load(Ordering::Relaxed)
 }
 
 pub fn show_main_window(app: &AppHandle) {
