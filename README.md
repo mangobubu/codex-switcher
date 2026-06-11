@@ -8,6 +8,24 @@
 
 **中文** | [English](#english) | [Русский](#русский)
 
+## Fork 分支说明
+
+本仓库是基于原作者 [VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) 的 fork。当前 `main` 与原作者仓库的对比基线如下：
+
+- 上游 `VallierDev/codex-switcher`：`main` 停在 `055e516`（`v0.7.3`，2026-06-05）。
+- 当前 fork `mangobubu/codex-switcher`：`main` 停在 `71aa097`（`v0.7.6`，2026-06-11）。
+- 分支差异范围：`055e516..HEAD`，共 9 个 fork 提交，版本线从 `0.7.3` 推进到 `0.7.6`。
+
+本 fork 在上游基础上增加/修改的内容：
+
+- **托盘配额面板增强**：新增左键托盘配额面板、常驻模式、标题栏拖动/窗口缩放、透明度滑块（10% - 100%）和更完整的中文显示；打开主页时常驻面板不会自动消失。
+- **Codex 本地实时配额监听**：新增 `codex_quota` 后端模块，增量读取 `~/.codex/sessions/**/rollout-*.jsonl` 里的 `rate_limits`，更新当前 ChatGPT 订阅号的 `cached_quota`，并通过 `codex-quota-updated` 推送给账号列表、Dashboard 和托盘面板。该监听只读本地 rollout 文件，不主动请求网络额度接口。
+- **账号清理与批量删除**：账号列表新增已选账号批量删除，以及按“未知账号 / 失败账号 / 过期账号 / 封禁账号”分类清理；删除只移除账号管理记录，不删除或清空 `~/.codex/auth.json`。
+- **配额显示与缓存同步修复**：将剩余额度计算对齐 Codex 客户端显示方式，修复 5H/周配额标题重复和剩余百分比差 1% 的问题；`refresh_relay_usage`、`get_quota_by_id` 和前端 `useUsage` 在缓存写回后会主动刷新 UI。
+- **远端同步与代理链路修复**：client/solo/remote pull 等同步路径会携带 Server current 的配额缓存，代理链路补充 Server switch 过期/耗尽日志和重置时间提示，WebSocket 认证失败路径避免误切号。
+- **发布与安装包调整**：Windows NSIS 安装器改为简体中文；GitHub Actions 的 macOS x64 构建切到 Intel runner；Release changelog 改为按“增加 / 修复 / 修改 / 移除 / 其他”分组生成。
+- **版本和依赖文件**：`package.json`、`Cargo.toml`、`tauri.conf.json` 更新到 `0.7.6`，新增 `yarn.lock`，并补充本仓库 AGENTS 约定。
+
 Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面工具。它把账号管理、配额观察、本地代理、无损自动切号、中转站、Coding Plan 接入、远程账号池和 Skills 管理放在同一个 Tauri 应用里，适合长期使用 Codex CLI、Codex App，以及支持 Codex 插件的 VS Code 及其衍生 IDE 的多账号环境。
 
 **一句话：当前账号限额了，前端任务不用停，Codex Switcher 在代理层自动换号、切换中转站或接入 Coding Plan，并自动重发请求。Coding Plan 目前已支持 GLM 和 Xiaomi MiMo Token Plan，其他平台待实测。**
