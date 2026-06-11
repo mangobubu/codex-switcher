@@ -114,36 +114,87 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           git fetch --force --tags
           PREVIOUS_TAG="$(git tag --list "v*" --sort=-v:refname | grep -v "^${TAG}$" | head -n 1 || true)"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "${TMP_DIR}"' EXIT
+
+          : > "${TMP_DIR}/增加.md"
+          : > "${TMP_DIR}/修复.md"
+          : > "${TMP_DIR}/修改.md"
+          : > "${TMP_DIR}/移除.md"
+          : > "${TMP_DIR}/其他.md"
+
+          if [ -n "${PREVIOUS_TAG}" ]; then
+            RANGE="${PREVIOUS_TAG}..${TAG}"
+            git log "${RANGE}" --reverse --pretty=format:%B > "${TMP_DIR}/commits.txt"
+          else
+            RANGE="${TAG}"
+            git log -1 --pretty=format:%B > "${TMP_DIR}/commits.txt"
+          fi
+
+          while IFS= read -r line || [ -n "${line}" ]; do
+            item="$(printf '%s' "${line}" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+            [ -z "${item}" ] && continue
+
+            case "${item}" in
+              "feat:"*|"新增"*|"增加"*|"支持"*|"加入"*)
+                category="增加"
+                ;;
+              "fix:"*|"修复"*|"解决"*|"纠正"*)
+                category="修复"
+                ;;
+              "remove:"*|"移除"*|"删除"*|"去掉"*)
+                category="移除"
+                ;;
+              "chore:"*|"refactor:"*|"perf:"*|"style:"*|"docs:"*|"修改"*|"优化"*|"调整"*|"改进"*|"统一"*|"升级"*|"完善"*)
+                category="修改"
+                ;;
+              "本地验证"*|"验证"*|"git diff"*|"npm.cmd"*|"cargo check"*)
+                continue
+                ;;
+              *)
+                category="其他"
+                ;;
+            esac
+
+            item="${item#feat: }"
+            item="${item#fix: }"
+            item="${item#chore: }"
+            item="${item#refactor: }"
+            item="${item#perf: }"
+            item="${item#style: }"
+            item="${item#docs: }"
+            item="${item#remove: }"
+            printf -- "- %s\n" "${item}" >> "${TMP_DIR}/${category}.md"
+          done < "${TMP_DIR}/commits.txt"
+
+          write_section() {
+            local title="$1"
+            local file="${TMP_DIR}/${title}.md"
+            echo "## ${title}"
+            if [ -s "${file}" ]; then
+              cat "${file}"
+            else
+              echo "- 无"
+            fi
+            echo
+          }
 
           {
             echo "# 更新日志 - ${TAG}"
             echo
 
             if [ -n "${PREVIOUS_TAG}" ]; then
-              echo "比较范围：\`${PREVIOUS_TAG}...${TAG}\`"
-              echo
-              echo "## 变更记录"
-              COMMITS="$(git log "${PREVIOUS_TAG}..${TAG}" --pretty=format:"- %s (%h)" --no-merges || true)"
-              if [ -n "${COMMITS}" ]; then
-                echo "${COMMITS}"
-              else
-                echo "- 本次版本没有检测到普通提交。"
-              fi
-              echo
-              echo
-              echo "## 合并记录"
-              MERGES="$(git log "${PREVIOUS_TAG}..${TAG}" --pretty=format:"- %s (%h)" --merges || true)"
-              if [ -n "${MERGES}" ]; then
-                echo "${MERGES}"
-              else
-                echo "- 本次版本没有检测到合并提交。"
-              fi
+              echo "从 ${PREVIOUS_TAG} 更新到 ${TAG}。"
             else
-              echo "未找到上一个 tag，以下为当前版本提交："
-              echo
-              git log -1 --pretty=format:"- %s (%h)"
-              echo
+              echo "这是当前版本的首次发布说明。"
             fi
+            echo
+
+            write_section "增加"
+            write_section "修复"
+            write_section "修改"
+            write_section "移除"
+            write_section "其他"
           } > CHANGELOG.md
 
       - name: Create Release

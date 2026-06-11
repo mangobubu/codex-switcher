@@ -10,20 +10,49 @@ body.is-tray-popup,
 
 /* ===== 主面板 ===== */
 .tray-popup {
+    --tp-bg-alpha: 0.62;
+    --tp-shield-alpha: 0.12;
+    --tp-surface-alpha: 0.055;
+    --tp-emphasis-alpha: 0.1;
+    --tp-border-alpha: 0.1;
+    --tp-backdrop-brightness: 0.82;
+    --tp-backdrop-blur: 7px;
     width: 100%;
     height: 100vh;
     box-sizing: border-box;
-    background: linear-gradient(160deg, #1e1245 0%, #2a1754 40%, #1c1040 100%);
+    background: linear-gradient(
+        160deg,
+        rgba(30, 18, 69, var(--tp-bg-alpha)) 0%,
+        rgba(42, 23, 84, var(--tp-bg-alpha)) 40%,
+        rgba(28, 16, 64, var(--tp-bg-alpha)) 100%
+    );
     border-radius: 16px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, var(--tp-border-alpha));
     padding: 16px 18px;
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
     color: #e8e0f0;
     overflow: hidden;
     user-select: none;
+    position: relative;
     display: flex;
     flex-direction: column;
     gap: 12px;
+    isolation: isolate;
+    backdrop-filter: blur(var(--tp-backdrop-blur)) brightness(var(--tp-backdrop-brightness)) saturate(1.25);
+    -webkit-backdrop-filter: blur(var(--tp-backdrop-blur)) brightness(var(--tp-backdrop-brightness)) saturate(1.25);
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+}
+
+.tray-popup::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background:
+        radial-gradient(circle at 20% 0%, rgba(124, 92, 224, 0.16), transparent 38%),
+        linear-gradient(160deg, rgba(7, 5, 19, var(--tp-shield-alpha)), rgba(13, 9, 31, var(--tp-shield-alpha)));
+    pointer-events: none;
 }
 
 .tray-popup.pinned {
@@ -48,6 +77,8 @@ body.is-tray-popup,
 
 .tray-popup.pinned .tp-pin-control,
 .tray-popup.pinned .tp-pin-control *,
+.tray-popup.pinned .tp-opacity-control,
+.tray-popup.pinned .tp-opacity-control *,
 .tray-popup.pinned .tp-badge,
 .tray-popup.pinned button,
 .tray-popup.pinned input,
@@ -106,6 +137,43 @@ body.is-tray-popup,
     cursor: pointer;
 }
 
+.tp-opacity-control {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    align-items: center;
+    gap: 10px;
+    margin-top: -2px;
+    padding: 7px 9px;
+    border-radius: 8px;
+    background: rgba(8, 5, 22, var(--tp-surface-alpha));
+    border: 1px solid rgba(255, 255, 255, var(--tp-border-alpha));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.tp-opacity-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 72px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.58);
+    white-space: nowrap;
+}
+
+.tp-opacity-label strong {
+    color: #e9d5ff;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.tp-opacity-control input[type="range"] {
+    width: 100%;
+    height: 4px;
+    margin: 0;
+    accent-color: #a78bfa;
+    cursor: pointer;
+}
+
 .tp-badge {
     font-size: 10px;
     font-weight: 600;
@@ -122,7 +190,7 @@ body.is-tray-popup,
 /* ===== 账号 ===== */
 .tp-account {
     font-size: 12px;
-    color: rgba(255, 255, 255, 0.6);
+    color: rgba(255, 255, 255, 0.78);
     display: flex;
     align-items: center;
     gap: 7px;
@@ -166,14 +234,14 @@ body.is-tray-popup,
     margin-top: 4px;
     padding: 6px 10px;
     border-radius: 6px;
-    background: linear-gradient(135deg, rgba(56, 189, 248, 0.12) 0%, rgba(99, 102, 241, 0.12) 100%);
+    background: linear-gradient(135deg, rgba(8, 47, 73, var(--tp-emphasis-alpha)) 0%, rgba(49, 46, 129, var(--tp-emphasis-alpha)) 100%);
     border: 1px solid rgba(56, 189, 248, 0.25);
     font-size: 11px;
     color: rgba(255, 255, 255, 0.78);
 }
 
 .tp-anchor.matched {
-    background: rgba(56, 189, 248, 0.08);
+    background: rgba(8, 47, 73, var(--tp-emphasis-alpha));
     border-color: rgba(56, 189, 248, 0.18);
 }
 
@@ -195,10 +263,11 @@ body.is-tray-popup,
 
 /* ===== 单张卡片 ===== */
 .tp-card {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.07);
+    background: rgba(8, 5, 22, var(--tp-surface-alpha));
+    border: 1px solid rgba(255, 255, 255, var(--tp-border-alpha));
     border-radius: 10px;
     padding: 12px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
 }
 
 .tp-card-header {
@@ -208,7 +277,7 @@ body.is-tray-popup,
     margin-bottom: 6px;
     font-size: 10px;
     font-weight: 700;
-    color: rgba(255, 255, 255, 0.4);
+    color: rgba(255, 255, 255, 0.58);
     text-transform: uppercase;
     letter-spacing: 0.6px;
 }
@@ -253,13 +322,13 @@ body.is-tray-popup,
 .tp-unit {
     font-size: 15px;
     font-weight: 500;
-    color: rgba(255, 255, 255, 0.5);
+    color: rgba(255, 255, 255, 0.66);
 }
 
 .tp-remaining {
     font-size: 12px;
     font-weight: 400;
-    color: rgba(255, 255, 255, 0.35);
+    color: rgba(255, 255, 255, 0.58);
     margin-left: 4px;
 }
 
@@ -276,7 +345,7 @@ body.is-tray-popup,
 /* ===== 进度条 ===== */
 .tp-progress {
     height: 3px;
-    background: rgba(255, 255, 255, 0.06);
+    background: rgba(0, 0, 0, 0.22);
     border-radius: 2px;
     margin-bottom: 6px;
     overflow: hidden;
@@ -303,7 +372,7 @@ body.is-tray-popup,
 /* ===== 底部信息 ===== */
 .tp-reset {
     font-size: 10px;
-    color: rgba(255, 255, 255, 0.3);
+    color: rgba(255, 255, 255, 0.56);
 }
 
 .tp-compare {
@@ -314,7 +383,7 @@ body.is-tray-popup,
 
 .tp-token-detail {
     font-size: 10px;
-    color: rgba(255, 255, 255, 0.35);
+    color: rgba(255, 255, 255, 0.58);
 }
 
 /* ===== 按钮栏 ===== */
@@ -327,9 +396,9 @@ body.is-tray-popup,
 .tp-btn {
     flex: 1;
     padding: 7px 0;
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, var(--tp-border-alpha));
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.04);
+    background: rgba(8, 5, 22, var(--tp-surface-alpha));
     color: rgba(255, 255, 255, 0.6);
     font-size: 11px;
     font-weight: 600;
@@ -340,7 +409,7 @@ body.is-tray-popup,
 }
 
 .tp-btn:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.12);
     color: #fff;
 }
 

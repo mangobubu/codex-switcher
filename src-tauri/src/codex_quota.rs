@@ -32,10 +32,10 @@ struct RolloutCursor {
 
 #[derive(Debug, Clone)]
 struct RateLimitSnapshot {
-    primary_used: i32,
+    primary_used_percent: f64,
     primary_reset_at: Option<i64>,
     primary_window_minutes: Option<i64>,
-    secondary_used: i32,
+    secondary_used_percent: f64,
     secondary_reset_at: Option<i64>,
     secondary_window_minutes: Option<i64>,
     plan_type: Option<String>,
@@ -158,8 +158,8 @@ fn parse_rate_limits(v: &Value) -> Option<RateLimitSnapshot> {
         return None;
     }
 
-    let primary_used = percent_to_i32(primary.get("used_percent")?)?;
-    let secondary_used = percent_to_i32(secondary.get("used_percent")?)?;
+    let primary_used_percent = percent_to_f64(primary.get("used_percent")?)?;
+    let secondary_used_percent = percent_to_f64(secondary.get("used_percent")?)?;
     let credits = limits.get("credits").unwrap_or(&Value::Null);
     let has_credits = credits
         .get("has_credits")
@@ -171,10 +171,10 @@ fn parse_rate_limits(v: &Value) -> Option<RateLimitSnapshot> {
             .unwrap_or(false);
 
     Some(RateLimitSnapshot {
-        primary_used,
+        primary_used_percent,
         primary_reset_at: primary.get("resets_at").and_then(number_to_i64),
         primary_window_minutes: primary.get("window_minutes").and_then(number_to_i64),
-        secondary_used,
+        secondary_used_percent,
         secondary_reset_at: secondary.get("resets_at").and_then(number_to_i64),
         secondary_window_minutes: secondary.get("window_minutes").and_then(number_to_i64),
         plan_type: limits
@@ -281,16 +281,18 @@ fn resolve_target_account_id(store: &AccountStore) -> Option<String> {
 }
 
 fn snapshot_to_usage(snap: &RateLimitSnapshot, plan_type: &str) -> UsageDisplay {
-    let five_hour_left = (100 - snap.primary_used).clamp(0, 100);
-    let weekly_left = (100 - snap.secondary_used).clamp(0, 100);
+    let five_hour_used = used_display_percent(snap.primary_used_percent);
+    let five_hour_left = left_display_percent(snap.primary_used_percent);
+    let weekly_used = used_display_percent(snap.secondary_used_percent);
+    let weekly_left = left_display_percent(snap.secondary_used_percent);
     UsageDisplay {
         plan_type: plan_type.to_string(),
-        five_hour_used: snap.primary_used,
+        five_hour_used,
         five_hour_left,
         five_hour_label: limits_label(snap.primary_window_minutes, "5H 限额"),
         five_hour_reset: reset_text(snap.primary_reset_at),
         five_hour_reset_at: snap.primary_reset_at,
-        weekly_used: snap.secondary_used,
+        weekly_used,
         weekly_left,
         weekly_label: limits_label(snap.secondary_window_minutes, "周限额"),
         weekly_reset: reset_text(snap.secondary_reset_at),
@@ -317,8 +319,21 @@ fn usage_to_cached(u: &UsageDisplay) -> CachedQuota {
     }
 }
 
-fn percent_to_i32(v: &Value) -> Option<i32> {
-    number_to_f64(v).map(|n| n.round().clamp(0.0, 100.0) as i32)
+fn percent_to_f64(v: &Value) -> Option<f64> {
+    let n = number_to_f64(v)?;
+    if n.is_finite() {
+        Some(n.clamp(0.0, 100.0))
+    } else {
+        None
+    }
+}
+
+fn used_display_percent(used_percent: f64) -> i32 {
+    used_percent.ceil().clamp(0.0, 100.0) as i32
+}
+
+fn left_display_percent(used_percent: f64) -> i32 {
+    (100.0 - used_percent).floor().clamp(0.0, 100.0) as i32
 }
 
 fn number_to_f64(v: &Value) -> Option<f64> {

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type MouseEvent as ReactMouseEvent } from 'react';
+import { useState, useEffect, useRef, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -88,16 +88,33 @@ function statusLabel(pct: number): string {
     return '紧张';
 }
 
+function displayPercent(pct: number): number {
+    if (!Number.isFinite(pct)) return 0;
+    return Math.floor(Math.min(100, Math.max(0, pct)));
+}
+
+function clampOpacity(value: number): number {
+    if (!Number.isFinite(value)) return 100;
+    return Math.min(100, Math.max(10, Math.round(value)));
+}
+
 export function TrayPopup() {
     const [data, setData] = useState<TrayData | null>(null);
     const [switching, setSwitching] = useState(false);
     const [pinned, setPinned] = useState(() => localStorage.getItem('tray-popup-pinned') === 'true');
+    const [opacity, setOpacity] = useState(() => clampOpacity(Number(localStorage.getItem('tray-popup-opacity') || 100)));
     const cleanupManualDragRef = useRef<(() => void) | null>(null);
 
     const applyPinned = async (next: boolean) => {
         setPinned(next);
         localStorage.setItem('tray-popup-pinned', String(next));
         await invoke('set_tray_popup_pinned_cmd', { pinned: next });
+    };
+
+    const applyOpacity = (nextValue: number) => {
+        const next = clampOpacity(nextValue);
+        setOpacity(next);
+        localStorage.setItem('tray-popup-opacity', String(next));
     };
 
     const fetchData = async () => {
@@ -258,15 +275,28 @@ export function TrayPopup() {
 
     const handleOpenDashboard = async () => {
         await invoke('show_main_window_cmd');
-        getCurrentWebviewWindow().hide();
+        if (!pinned) {
+            getCurrentWebviewWindow().hide();
+        }
     };
 
     const q = data?.account?.cached_quota;
     const fiveH = q?.five_hour_left ?? 0;
     const weekly = q?.weekly_left ?? 0;
+    const opacityRatio = opacity / 100;
+    const isOpaque = opacity >= 100;
+    const panelStyle = {
+        '--tp-bg-alpha': isOpaque ? 1 : Math.max(0.04, opacityRatio * 0.62),
+        '--tp-shield-alpha': isOpaque ? 0 : 0.12 + (1 - opacityRatio) * 0.26,
+        '--tp-surface-alpha': isOpaque ? 0.055 : 0.055 + (1 - opacityRatio) * 0.09,
+        '--tp-emphasis-alpha': isOpaque ? 0.1 : 0.1 + (1 - opacityRatio) * 0.14,
+        '--tp-border-alpha': isOpaque ? 0.1 : 0.1 + (1 - opacityRatio) * 0.1,
+        '--tp-backdrop-brightness': isOpaque ? 1 : 0.58 + opacityRatio * 0.24,
+        '--tp-backdrop-blur': isOpaque ? '0px' : `${7 + (1 - opacityRatio) * 10}px`,
+    } as CSSProperties;
 
     return (
-        <div className={`tray-popup ${pinned ? 'pinned' : ''}`}>
+        <div className={`tray-popup ${pinned ? 'pinned' : ''}`} style={panelStyle}>
             {/* Header */}
             <div className="tp-header" data-tauri-drag-region={pinned ? true : undefined} onMouseDown={handleDragStart}>
                 <div className="tp-title">
@@ -287,6 +317,22 @@ export function TrayPopup() {
                 {data?.proxy.is_running && (
                     <div className="tp-badge running">代理已开</div>
                 )}
+            </div>
+
+            <div className="tp-opacity-control">
+                <div className="tp-opacity-label">
+                    <span>透明度</span>
+                    <strong>{opacity}%</strong>
+                </div>
+                <input
+                    type="range"
+                    min="10"
+                    max="100"
+                    step="5"
+                    value={opacity}
+                    aria-label="面板透明度"
+                    onChange={e => applyOpacity(Number(e.target.value))}
+                />
             </div>
 
             {/* Account */}
@@ -320,12 +366,11 @@ export function TrayPopup() {
             <div className="tp-cards">
                 <div className={`tp-card ${statusClass(fiveH)}`}>
                     <div className="tp-card-header">
-                        <span className="tp-card-icon">5h</span>
                         <span>5H 配额</span>
                         <span className={`tp-status ${statusClass(fiveH)}`}>{statusLabel(fiveH)}</span>
                     </div>
                     <div className="tp-card-value">
-                        {q ? Math.round(fiveH) : '-'}<span className="tp-unit">%</span>
+                        {q ? displayPercent(fiveH) : '-'}<span className="tp-unit">%</span>
                         <span className="tp-remaining">剩余</span>
                     </div>
                     <div className="tp-progress">
@@ -338,12 +383,11 @@ export function TrayPopup() {
 
                 <div className={`tp-card ${statusClass(weekly)}`}>
                     <div className="tp-card-header">
-                        <span className="tp-card-icon">周</span>
                         <span>周配额</span>
                         <span className={`tp-status ${statusClass(weekly)}`}>{statusLabel(weekly)}</span>
                     </div>
                     <div className="tp-card-value">
-                        {q ? Math.round(weekly) : '-'}<span className="tp-unit">%</span>
+                        {q ? displayPercent(weekly) : '-'}<span className="tp-unit">%</span>
                         <span className="tp-remaining">剩余</span>
                     </div>
                     <div className="tp-progress">

@@ -222,7 +222,10 @@ pub fn show_main_window(app: &AppHandle) {
 /// 供 Tauri command 调用的入口
 pub fn show_main_window_from_cmd(app: &AppHandle) {
     show_main_window(app);
-    // 同时隐藏 popup
+    if is_popup_pinned() {
+        return;
+    }
+    // 非常驻时打开主窗口后隐藏 popup，保持旧体验。
     if let Some(popup) = app.get_webview_window("tray-popup") {
         let _ = popup.hide();
     }

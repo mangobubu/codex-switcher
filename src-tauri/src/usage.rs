@@ -191,11 +191,13 @@ impl UsageFetcher {
 
         // 解析 5 小时窗口 (Primary)
         let primary_val = rate_limit.and_then(|r| r.get("primary_window"));
-        let (p_used, p_reset, p_label, p_reset_at) = Self::parse_window(primary_val, "5H 限额");
+        let (p_used, p_left, p_reset, p_label, p_reset_at) =
+            Self::parse_window(primary_val, "5H 限额");
 
         // 解析周窗口 (Secondary)
         let secondary_val = rate_limit.and_then(|r| r.get("secondary_window"));
-        let (s_used, s_reset, s_label, s_reset_at) = Self::parse_window(secondary_val, "周限额");
+        let (s_used, s_left, s_reset, s_label, s_reset_at) =
+            Self::parse_window(secondary_val, "周限额");
 
         // 解析额度
         let credits = json.get("credits");
@@ -214,12 +216,12 @@ impl UsageFetcher {
         Ok(UsageDisplay {
             plan_type,
             five_hour_used: p_used,
-            five_hour_left: 100 - p_used,
+            five_hour_left: p_left,
             five_hour_label: p_label,
             five_hour_reset: p_reset,
             five_hour_reset_at: p_reset_at,
             weekly_used: s_used,
-            weekly_left: 100 - s_used,
+            weekly_left: s_left,
             weekly_label: s_label,
             weekly_reset: s_reset,
             weekly_reset_at: s_reset_at,
@@ -233,18 +235,22 @@ impl UsageFetcher {
     fn parse_window(
         window: Option<&Value>,
         default_label: &str,
-    ) -> (i32, String, String, Option<i64>) {
+    ) -> (i32, i32, String, String, Option<i64>) {
         let window = match window {
             Some(w) => w,
-            None => return (0, "未知".to_string(), default_label.to_string(), None),
+            None => return (0, 0, "未知".to_string(), default_label.to_string(), None),
         };
 
-        // 关键修复：使用 f64 解析百分比，然后四舍五入
-        let used_percent = window
+        // 与 Codex 客户端 UI 对齐：剩余值按 floor(100 - used_percent) 展示，
+        // 避免 used_percent=58.x 时应用还显示 42%，而 Codex 已显示 41%。
+        let used_percent_raw = window
             .get("used_percent")
             .and_then(Self::parse_number)
-            .map(|f| f.round() as i32)
-            .unwrap_or(0);
+            .filter(|f| f.is_finite())
+            .map(|f| f.clamp(0.0, 100.0))
+            .unwrap_or(0.0);
+        let used_percent = used_percent_raw.ceil().clamp(0.0, 100.0) as i32;
+        let left_percent = (100.0 - used_percent_raw).floor().clamp(0.0, 100.0) as i32;
 
         let reset_at = window
             .get("reset_at")
@@ -285,7 +291,7 @@ impl UsageFetcher {
             }
         };
 
-        (used_percent, reset_str, label, reset_at)
+        (used_percent, left_percent, reset_str, label, reset_at)
     }
 
     /// 根据窗口秒数获取人类可读标签
